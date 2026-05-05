@@ -37,7 +37,7 @@ dev = [
 ]
 
 [project.scripts]
-deepseek-cursor-proxy = "deepseek_cursor_proxy.server:main"
+deepseek-cursor-proxy = "deepseek_cursor_proxy.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

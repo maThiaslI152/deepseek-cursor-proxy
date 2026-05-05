@@ -10,11 +10,13 @@ import zlib
 
 from deepseek_cursor_proxy.config import ProxyConfig
 from deepseek_cursor_proxy.reasoning_store import ReasoningStore
-from deepseek_cursor_proxy.server import (
-    DeepSeekProxyHandler,
-    build_arg_parser,
+from deepseek_cursor_proxy.cli import build_arg_parser
+from deepseek_cursor_proxy.log_format import (
     read_response_body,
     summarize_chat_payload,
+)
+from deepseek_cursor_proxy.server import (
+    DeepSeekProxyHandler,
 )
 
 

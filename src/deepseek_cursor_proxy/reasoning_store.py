@@ -185,6 +185,10 @@ def namespace_reasoning_keys(
     return keys
 
 
+SCHEMA_VERSION = 1
+SCHEMA_META_TABLE = "reasoning_cache_meta"
+
+
 class ReasoningStore:
     def __init__(
         self,
@@ -215,8 +219,56 @@ class ReasoningStore:
                 created_at REAL NOT NULL
             )
             """)
-        self._conn.commit()
+        self._init_schema()
+        self._migrate()
         self.prune()
+
+    @property
+    def schema_version(self) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT value FROM {SCHEMA_META_TABLE} WHERE key = 'schema_version'"
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+    def _init_schema(self) -> None:
+        self._conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {SCHEMA_META_TABLE} (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """)
+        self._conn.execute(
+            f"""
+            INSERT INTO {SCHEMA_META_TABLE}(key, value)
+            VALUES ('schema_version', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (str(SCHEMA_VERSION),),
+        )
+        self._conn.commit()
+
+    def _migrate(self) -> None:
+        version = self.schema_version
+        if version >= SCHEMA_VERSION:
+            return
+        # v0→v1: No-op. Old scope-only keys remain valid for their original
+        # conversations. The new namespace keys are written on subsequent
+        # store_assistant_message calls; the cache self-heals within one
+        # session. Schema version tracking ensures future migrations have
+        # a known starting point.
+        self._set_meta("schema_version", str(SCHEMA_VERSION))
+        self._conn.commit()
+
+    def _set_meta(self, key: str, value: str) -> None:
+        self._conn.execute(
+            f"""
+            INSERT INTO {SCHEMA_META_TABLE}(key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
 
     def close(self) -> None:
         with self._lock:

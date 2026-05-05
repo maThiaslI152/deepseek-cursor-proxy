@@ -30,6 +30,7 @@ DEFAULT_CORS = False
 DEFAULT_MISSING_REASONING_STRATEGY = "recover"
 DEFAULT_REASONING_CACHE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_REASONING_CACHE_MAX_ROWS = 100_000
+DEFAULT_MAX_CONCURRENT_REQUESTS = 20
 
 DEFAULT_CONFIG_HEADER = (
     "# This file was created automatically at ~/.deepseek-cursor-proxy/config.yaml."
@@ -186,6 +187,7 @@ class ProxyConfig:
     reasoning_effort: str = DEFAULT_REASONING_EFFORT
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT
     max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES
+    max_concurrent_requests: int = DEFAULT_MAX_CONCURRENT_REQUESTS
     reasoning_content_path: Path = field(default_factory=default_reasoning_content_path)
     missing_reasoning_strategy: str = DEFAULT_MISSING_REASONING_STRATEGY
     reasoning_cache_max_age_seconds: int = DEFAULT_REASONING_CACHE_MAX_AGE_SECONDS
@@ -233,6 +235,10 @@ class ProxyConfig:
             max_request_body_bytes=as_int(
                 setting_value(settings, "max_request_body_bytes"),
                 DEFAULT_MAX_REQUEST_BODY_BYTES,
+            ),
+            max_concurrent_requests=as_int(
+                setting_value(settings, "max_concurrent_requests"),
+                DEFAULT_MAX_CONCURRENT_REQUESTS,
             ),
             reasoning_content_path=as_path(
                 setting_value(settings, "reasoning_content_path"),
