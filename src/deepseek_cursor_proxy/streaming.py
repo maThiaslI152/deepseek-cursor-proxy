@@ -6,7 +6,6 @@ from typing import Any
 
 from .reasoning_store import ReasoningStore
 
-
 THINKING_BLOCK_START = "<think>\n"
 THINKING_BLOCK_END = "\n</think>\n\n"
 

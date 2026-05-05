@@ -18,7 +18,6 @@ from deepseek_cursor_proxy.transform import (
     strip_cursor_thinking_blocks,
 )
 
-
 DEFAULT_CONFIG = ProxyConfig()
 DEFAULT_CACHE_NAMESPACE = reasoning_cache_namespace(
     DEFAULT_CONFIG,
@@ -470,7 +469,7 @@ class TransformTests(unittest.TestCase):
             prepared.payload["messages"][1]["reasoning_content"], "first reasoning"
         )
 
-    def test_strict_hit_backfills_portable_cache_for_mode_switch(self) -> None:
+    def test_namespace_keys_provide_recall_across_conversations(self) -> None:
         agent_prior = [
             {"role": "system", "content": "Agent mode."},
             {"role": "user", "content": "set up the task"},
@@ -495,6 +494,8 @@ class TransformTests(unittest.TestCase):
         self.store.store_assistant_message(
             assistant_message,
             cache_scope(agent_prior),
+            DEFAULT_CACHE_NAMESPACE,
+            agent_prior,
         )
 
         strict_prepared = prepare_upstream_request(
@@ -508,7 +509,7 @@ class TransformTests(unittest.TestCase):
             ProxyConfig(),
             self.store,
         )
-        portable_prepared = prepare_upstream_request(
+        cross_prepared = prepare_upstream_request(
             {
                 "model": "deepseek-v4-pro",
                 "messages": [
@@ -521,16 +522,15 @@ class TransformTests(unittest.TestCase):
         )
 
         self.assertEqual(strict_prepared.patched_reasoning_messages, 1)
-        self.assertEqual(portable_prepared.patched_reasoning_messages, 1)
-        self.assertEqual(portable_prepared.missing_reasoning_messages, 0)
+        self.assertEqual(cross_prepared.patched_reasoning_messages, 1)
+        self.assertEqual(cross_prepared.missing_reasoning_messages, 0)
         self.assertEqual(
-            portable_prepared.payload["messages"][3]["reasoning_content"],
+            cross_prepared.payload["messages"][3]["reasoning_content"],
             "Need README before answering.",
         )
-        self.assertTrue(
-            str(portable_prepared.reasoning_diagnostics[-1]["hit_kind"]).startswith(
-                "portable_"
-            )
+        hit_kind = str(cross_prepared.reasoning_diagnostics[-1]["hit_kind"])
+        self.assertIn(
+            hit_kind, {"portable_message_signature", "namespace_message_signature"}
         )
 
     def test_portable_turn_cache_restores_final_assistant_after_tool_result(
@@ -1003,17 +1003,24 @@ class TransformTests(unittest.TestCase):
             first_recovered.payload["messages"],
             first_recovered.cache_namespace,
             content_prefix=first_recovered.recovery_notice,
-            recording_contexts=first_recovered.record_response_contexts,
         )
         recovered_assistant = json.loads(rewritten)["choices"][0]["message"]
-        self.assertEqual(len(first_recovered.record_response_contexts), 2)
-        for scope, _messages in first_recovered.record_response_contexts:
-            self.assertEqual(
-                self.store.get(
-                    f"scope:{scope}:signature:{message_signature(recovered_assistant)}"
-                ),
-                "Need the new lookup.",
-            )
+
+        # Verify reasoning is stored under the active scope key and namespace key
+        active_scope = conversation_scope(
+            first_recovered.payload["messages"],
+            first_recovered.cache_namespace,
+        )
+        self.assertEqual(
+            self.store.get(f"scope:{active_scope}:tool_call:call_new"),
+            "Need the new lookup.",
+        )
+        self.assertEqual(
+            self.store.get(
+                f"namespace:{first_recovered.cache_namespace}:" f"tool_call:call_new"
+            ),
+            "Need the new lookup.",
+        )
         recovered_assistant.pop("reasoning_content", None)
 
         second_payload = {

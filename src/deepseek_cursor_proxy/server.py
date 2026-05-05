@@ -32,7 +32,6 @@ from .transform import (
     rewrite_response_body,
 )
 
-
 LOG = logging.getLogger("deepseek_cursor_proxy")
 
 
@@ -284,9 +283,6 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     prepared.cache_namespace,
                     prepared.recovery_notice,
                     trace=trace,
-                    record_response_scope=prepared.record_response_scope,
-                    record_response_messages=prepared.record_response_messages,
-                    record_response_contexts=prepared.record_response_contexts,
                 )
             else:
                 sent_response = self._proxy_regular_response(
@@ -296,9 +292,6 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     prepared.cache_namespace,
                     prepared.recovery_notice,
                     trace=trace,
-                    record_response_scope=prepared.record_response_scope,
-                    record_response_messages=prepared.record_response_messages,
-                    record_response_contexts=prepared.record_response_contexts,
                 )
             if not sent_response.sent:
                 self._finish_trace(
@@ -522,9 +515,6 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         cache_namespace: str,
         recovery_notice: str | None = None,
         trace: TraceRequest | None = None,
-        record_response_scope: str | None = None,
-        record_response_messages: list[dict[str, Any]] | None = None,
-        record_response_contexts: list[tuple[str, list[dict[str, Any]]]] | None = None,
     ) -> ProxyResponseResult:
         body = read_response_body(response)
         upstream_body = body
@@ -537,9 +527,6 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 request_messages,
                 cache_namespace,
                 content_prefix=recovery_notice,
-                scope=record_response_scope,
-                prior_messages=record_response_messages,
-                recording_contexts=record_response_contexts,
             )
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             LOG.warning("failed to rewrite upstream JSON response: %s", exc)
@@ -591,9 +578,6 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         cache_namespace: str,
         recovery_notice: str | None = None,
         trace: TraceRequest | None = None,
-        record_response_scope: str | None = None,
-        record_response_messages: list[dict[str, Any]] | None = None,
-        record_response_contexts: list[tuple[str, list[dict[str, Any]]]] | None = None,
     ) -> ProxyResponseResult:
         if trace is not None:
             trace.record_upstream_response(
@@ -622,27 +606,14 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             return ProxyResponseResult(False)
         self.close_connection = True
 
+        scope = conversation_scope(request_messages, cache_namespace)
+        response_contexts = [(scope, request_messages)]
         accumulator = StreamAccumulator()
         usage: dict[str, Any] | None = None
         display_adapter = (
             CursorReasoningDisplayAdapter()
             if self.config.cursor_display_reasoning
             else None
-        )
-        scope = (
-            record_response_scope
-            if record_response_scope is not None
-            else conversation_scope(request_messages, cache_namespace)
-        )
-        response_prior_messages = (
-            record_response_messages
-            if record_response_messages is not None
-            else request_messages
-        )
-        response_contexts = (
-            record_response_contexts
-            if record_response_contexts is not None
-            else [(scope, response_prior_messages)]
         )
         finalized = False
         pending_recovery_notice = recovery_notice

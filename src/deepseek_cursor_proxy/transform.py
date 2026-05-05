@@ -16,7 +16,6 @@ from .reasoning_store import (
     turn_context_signature,
 )
 
-
 SUPPORTED_REQUEST_FIELDS = {
     "model",
     "messages",
@@ -99,11 +98,6 @@ class PreparedRequest:
     recovered_reasoning_messages: int = 0
     recovery_dropped_messages: int = 0
     recovery_notice: str | None = None
-    record_response_scope: str | None = None
-    record_response_messages: list[dict[str, Any]] = field(default_factory=list)
-    record_response_contexts: list[tuple[str, list[dict[str, Any]]]] = field(
-        default_factory=list
-    )
     reasoning_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     recovery_steps: list[dict[str, Any]] = field(default_factory=list)
     continued_recovery_boundary: bool = False
@@ -283,13 +277,6 @@ def normalize_message(
                             hit_kind = lookup_key["kind"]
                             normalized["reasoning_content"] = restored
                             patched = True
-                            if not lookup_key.get("portable"):
-                                store.backfill_portable_aliases(
-                                    normalized,
-                                    restored,
-                                    cache_namespace,
-                                    prior_messages,
-                                )
                             break
                 if needs_reasoning and not patched:
                     missing = True
@@ -406,6 +393,47 @@ def reasoning_lookup_keys(
                     f"tool_call_signature:{tool_call_signature(tool_call)}"
                 ),
                 "turn_context_signature": turn_signature,
+                "portable": True,
+                "hit": False,
+            }
+            for tool_call in (message.get("tool_calls") or [])
+            if isinstance(tool_call, dict)
+        )
+    # Priority 3: broad namespace keys (any conversation, same API config).
+    # These survive Cursor context resets by depending only on message
+    # content + API config, not on the conversation prefix.
+    if cache_namespace:
+        keys.append(
+            {
+                "kind": "namespace_message_signature",
+                "key": (
+                    f"namespace:{cache_namespace}:"
+                    f"signature:{message_signature(message)}"
+                ),
+                "portable": True,
+                "hit": False,
+            }
+        )
+        keys.extend(
+            {
+                "kind": "namespace_tool_call_id",
+                "tool_call_id": tool_call_id,
+                "key": (f"namespace:{cache_namespace}:" f"tool_call:{tool_call_id}"),
+                "portable": True,
+                "hit": False,
+            }
+            for tool_call_id in tool_call_ids(message)
+        )
+        keys.extend(
+            {
+                "kind": "namespace_tool_call_signature",
+                "function_name": str(
+                    (tool_call.get("function") or {}).get("name") or ""
+                ),
+                "key": (
+                    f"namespace:{cache_namespace}:"
+                    f"tool_call_signature:{tool_call_signature(tool_call)}"
+                ),
                 "portable": True,
                 "hit": False,
             }
@@ -652,22 +680,6 @@ def reasoning_cache_namespace(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def response_recording_contexts(
-    *items: tuple[str, list[dict[str, Any]]] | None,
-) -> list[tuple[str, list[dict[str, Any]]]]:
-    contexts: list[tuple[str, list[dict[str, Any]]]] = []
-    seen: set[str] = set()
-    for item in items:
-        if item is None:
-            continue
-        scope, messages = item
-        if scope in seen:
-            continue
-        seen.add(scope)
-        contexts.append((scope, messages))
-    return contexts
-
-
 def prepare_upstream_request(
     payload: dict[str, Any],
     config: ProxyConfig,
@@ -731,18 +743,13 @@ def prepare_upstream_request(
         prepared.get("reasoning_effort"),
         authorization,
     )
-    pre_repair_messages, _, _, _ = normalize_messages(
+    messages_for_repair, _, _, _ = normalize_messages(
         payload.get("messages"),
         None,
         cache_namespace,
         repair_reasoning=False,
         keep_reasoning=not thinking_disabled,
     )
-    record_response_messages = pre_repair_messages
-    record_response_scope = conversation_scope(
-        record_response_messages, cache_namespace
-    )
-    messages_for_repair = pre_repair_messages
     continued_recovery_boundary = False
     retired_prefix_messages = 0
     recovered_count = 0
@@ -750,7 +757,7 @@ def prepare_upstream_request(
     recovery_notice = None
     recovery_steps: list[dict[str, Any]] = []
     if thinking_enabled and config.missing_reasoning_strategy == "recover":
-        boundary = active_messages_from_recovery_boundary(pre_repair_messages)
+        boundary = active_messages_from_recovery_boundary(messages_for_repair)
         if boundary is not None:
             messages_for_repair, retired_prefix_messages, boundary_step = boundary
             continued_recovery_boundary = True
@@ -790,11 +797,6 @@ def prepare_upstream_request(
         )
         reasoning_diagnostics.extend(latest_diagnostics)
     prepared["messages"] = messages
-    active_record_response_scope = conversation_scope(messages, cache_namespace)
-    record_response_contexts = response_recording_contexts(
-        (record_response_scope, record_response_messages),
-        (active_record_response_scope, messages),
-    )
 
     return PreparedRequest(
         payload=prepared,
@@ -806,9 +808,6 @@ def prepare_upstream_request(
         recovered_reasoning_messages=recovered_count,
         recovery_dropped_messages=recovery_dropped_messages,
         recovery_notice=recovery_notice,
-        record_response_scope=record_response_scope,
-        record_response_messages=record_response_messages,
-        record_response_contexts=record_response_contexts,
         reasoning_diagnostics=reasoning_diagnostics,
         recovery_steps=recovery_steps,
         continued_recovery_boundary=continued_recovery_boundary,
@@ -821,9 +820,6 @@ def record_response_reasoning(
     store: ReasoningStore | None,
     request_messages: list[dict[str, Any]],
     cache_namespace: str = "",
-    scope: str | None = None,
-    prior_messages: list[dict[str, Any]] | None = None,
-    recording_contexts: list[tuple[str, list[dict[str, Any]]]] | None = None,
 ) -> int:
     if store is None:
         return 0
@@ -831,28 +827,18 @@ def record_response_reasoning(
     choices = response_payload.get("choices")
     if not isinstance(choices, list):
         return stored
-    if recording_contexts is None:
-        response_scope = (
-            scope
-            if scope is not None
-            else conversation_scope(request_messages, cache_namespace)
-        )
-        response_prior_messages = (
-            prior_messages if prior_messages is not None else request_messages
-        )
-        recording_contexts = [(response_scope, response_prior_messages)]
+    response_scope = conversation_scope(request_messages, cache_namespace)
     for choice in choices:
         if not isinstance(choice, dict):
             continue
         message = choice.get("message")
         if isinstance(message, dict):
-            for response_scope, response_prior_messages in recording_contexts:
-                stored += store.store_assistant_message(
-                    message,
-                    response_scope,
-                    cache_namespace,
-                    response_prior_messages,
-                )
+            stored += store.store_assistant_message(
+                message,
+                response_scope,
+                cache_namespace,
+                request_messages,
+            )
     return stored
 
 
@@ -863,9 +849,6 @@ def rewrite_response_body(
     request_messages: list[dict[str, Any]],
     cache_namespace: str = "",
     content_prefix: str | None = None,
-    scope: str | None = None,
-    prior_messages: list[dict[str, Any]] | None = None,
-    recording_contexts: list[tuple[str, list[dict[str, Any]]]] | None = None,
 ) -> bytes:
     response_payload = json.loads(body.decode("utf-8"))
     if isinstance(response_payload, dict):
@@ -876,9 +859,6 @@ def rewrite_response_body(
             store,
             request_messages,
             cache_namespace,
-            scope=scope,
-            prior_messages=prior_messages,
-            recording_contexts=recording_contexts,
         )
         if "model" in response_payload:
             response_payload["model"] = original_model

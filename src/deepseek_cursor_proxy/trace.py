@@ -10,7 +10,6 @@ import threading
 import time
 from typing import Any
 
-
 TRACE_SCHEMA_VERSION = 1
 
 
@@ -234,10 +233,6 @@ class TraceRequest:
             "recovered_reasoning_messages": prepared.recovered_reasoning_messages,
             "recovery_dropped_messages": prepared.recovery_dropped_messages,
             "recovery_notice": prepared.recovery_notice,
-            "record_response_scope": prepared.record_response_scope,
-            "record_response_scopes": [
-                scope for scope, _messages in prepared.record_response_contexts
-            ],
             "continued_recovery_boundary": prepared.continued_recovery_boundary,
             "retired_prefix_messages": prepared.retired_prefix_messages,
             "reasoning_diagnostics": prepared.reasoning_diagnostics,

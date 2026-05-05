@@ -24,7 +24,6 @@ from deepseek_cursor_proxy.transform import (
     reasoning_cache_namespace,
 )
 
-
 TOOL_REASONING = "I need the current date before answering."
 FINAL_REASONING = "The tool result gives the date, so I can answer."
 FINAL_CONTENT = "Final answer after using the tool."

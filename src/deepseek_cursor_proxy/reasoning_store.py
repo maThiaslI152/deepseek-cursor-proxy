@@ -155,6 +155,36 @@ def portable_reasoning_keys(
     return keys
 
 
+def namespace_reasoning_keys(
+    message: dict[str, Any],
+    cache_namespace: str,
+) -> list[str]:
+    """Broad namespace-scoped keys that survive conversation prefix changes.
+
+    Unlike scope keys (which incorporate the full message prefix hash) and
+    portable keys (which incorporate the turn-context tail hash), these keys
+    only depend on the cache_namespace (API config + auth hash) plus the
+    message content itself. This means two different conversations with the
+    same API key and same tool call signature share cached reasoning,
+    providing recall across Cursor context resets.
+
+    Lookup should try scope keys -> portable keys -> namespace keys, in order.
+    """
+    if not cache_namespace:
+        return []
+    keys = [f"namespace:{cache_namespace}:signature:{message_signature(message)}"]
+    keys.extend(
+        f"namespace:{cache_namespace}:tool_call:{tool_call_id}"
+        for tool_call_id in tool_call_ids(message)
+    )
+    keys.extend(
+        f"namespace:{cache_namespace}:tool_call_signature:{tool_call_signature(tool_call)}"
+        for tool_call in (message.get("tool_calls") or [])
+        if isinstance(tool_call, dict)
+    )
+    return keys
+
+
 class ReasoningStore:
     def __init__(
         self,
@@ -177,16 +207,14 @@ class ReasoningStore:
         )
         if isinstance(self.reasoning_content_path, Path):
             self.reasoning_content_path.chmod(0o600)
-        self._conn.execute(
-            """
+        self._conn.execute("""
             CREATE TABLE IF NOT EXISTS reasoning_cache (
                 key TEXT PRIMARY KEY,
                 reasoning TEXT NOT NULL,
                 message_json TEXT NOT NULL,
                 created_at REAL NOT NULL
             )
-            """
-        )
+            """)
         self._conn.commit()
         self.prune()
 
@@ -237,6 +265,8 @@ class ReasoningStore:
             return 0
 
         keys = scoped_reasoning_keys(message, scope)
+        if cache_namespace:
+            keys.extend(namespace_reasoning_keys(message, cache_namespace))
         if prior_messages is not None:
             keys.extend(
                 portable_reasoning_keys(message, cache_namespace, prior_messages)
@@ -253,11 +283,16 @@ class ReasoningStore:
         cache_namespace: str = "",
         prior_messages: list[dict[str, Any]] | None = None,
     ) -> str | None:
+        # Priority 1: exact conversation scope keys
         keys = scoped_reasoning_keys(message, scope)
+        # Priority 2: portable turn-context keys (same tail, different prefix)
         if prior_messages is not None:
             keys.extend(
                 portable_reasoning_keys(message, cache_namespace, prior_messages)
             )
+        # Priority 3: broad namespace keys (any conversation, same API config)
+        if cache_namespace:
+            keys.extend(namespace_reasoning_keys(message, cache_namespace))
         for key in keys:
             reasoning = self.get(key)
             if reasoning is not None:
