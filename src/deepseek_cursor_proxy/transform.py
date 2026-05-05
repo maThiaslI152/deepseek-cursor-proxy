@@ -7,14 +7,17 @@ import re
 from typing import Any
 
 from .config import ProxyConfig
+from .logging import LOG
 from .reasoning_store import (
     ReasoningStore,
     conversation_scope,
     message_signature,
     tool_call_ids,
+    tool_call_names,
     tool_call_signature,
     turn_context_signature,
 )
+from .streaming import fold_reasoning_into_content
 
 SUPPORTED_REQUEST_FIELDS = {
     "model",
@@ -34,6 +37,13 @@ SUPPORTED_REQUEST_FIELDS = {
     "frequency_penalty",
     "logprobs",
     "top_logprobs",
+    # Standard OpenAI Chat Completions fields that DeepSeek either honors or
+    # safely ignores. Cursor and most OpenAI SDKs send these unconditionally,
+    # so forwarding keeps clients happy and avoids log spam.
+    "user",
+    "seed",
+    "n",
+    "logit_bias",
 }
 
 MESSAGE_FIELDS = {
@@ -69,15 +79,19 @@ EFFORT_ALIASES = {
 }
 
 CURSOR_THINKING_BLOCK_RE = re.compile(
-    r"<(?:think|thinking)>[\s\S]*?(?:</(?:think|thinking)>|$)\s*",
-    re.IGNORECASE,
+    r"""
+    (?:
+        <(?:think|thinking)\b[^>]*>[\s\S]*?(?:</(?:think|thinking)>|\Z)
+        |
+        <details\b[^>]*>\s*
+        <summary\b[^>]*>\s*Thinking\s*</summary>
+        [\s\S]*?(?:</details>|\Z)
+    )\s*
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 
 RECOVERY_NOTICE_TEXT = "[deepseek-cursor-proxy] Refreshed reasoning_content history."
-LEGACY_RECOVERY_NOTICE_TEXT = (
-    "Note: recovered this DeepSeek chat because older tool-call reasoning "
-    "was unavailable; continuing with recent context only."
-)
 RECOVERY_NOTICE_CONTENT = f"{RECOVERY_NOTICE_TEXT}\n\n"
 RECOVERY_SYSTEM_CONTENT = (
     "deepseek-cursor-proxy recovered this request because older DeepSeek "
@@ -102,6 +116,11 @@ class PreparedRequest:
     recovery_steps: list[dict[str, Any]] = field(default_factory=list)
     continued_recovery_boundary: bool = False
     retired_prefix_messages: int = 0
+    record_response_scope: str = ""
+    record_response_messages: list[dict[str, Any]] = field(default_factory=list)
+    record_response_contexts: list[tuple[str, list[dict[str, Any]]]] = field(
+        default_factory=list
+    )
 
 
 def normalize_reasoning_effort(value: Any) -> str:
@@ -354,6 +373,16 @@ def reasoning_lookup_keys(
         for tool_call in (message.get("tool_calls") or [])
         if isinstance(tool_call, dict)
     )
+    keys.extend(
+        {
+            "kind": "tool_name",
+            "function_name": tool_name,
+            "key": f"scope:{scope}:tool_name:{tool_name}",
+            "portable": False,
+            "hit": False,
+        }
+        for tool_name in tool_call_names(message)
+    )
     if cache_namespace and prior_messages is not None:
         turn_signature = turn_context_signature(prior_messages)
         keys.append(
@@ -399,6 +428,20 @@ def reasoning_lookup_keys(
             for tool_call in (message.get("tool_calls") or [])
             if isinstance(tool_call, dict)
         )
+        keys.extend(
+            {
+                "kind": "portable_tool_name",
+                "function_name": tool_name,
+                "key": (
+                    f"namespace:{cache_namespace}:turn:{turn_signature}:"
+                    f"tool_name:{tool_name}"
+                ),
+                "turn_context_signature": turn_signature,
+                "portable": True,
+                "hit": False,
+            }
+            for tool_name in tool_call_names(message)
+        )
     # Priority 3: broad namespace keys (any conversation, same API config).
     # These survive Cursor context resets by depending only on message
     # content + API config, not on the conversation prefix.
@@ -418,7 +461,7 @@ def reasoning_lookup_keys(
             {
                 "kind": "namespace_tool_call_id",
                 "tool_call_id": tool_call_id,
-                "key": (f"namespace:{cache_namespace}:" f"tool_call:{tool_call_id}"),
+                "key": (f"namespace:{cache_namespace}:tool_call:{tool_call_id}"),
                 "portable": True,
                 "hit": False,
             }
@@ -480,8 +523,31 @@ def has_recovery_notice(message: dict[str, Any]) -> bool:
     return (
         message.get("role") == "assistant"
         and isinstance(content, str)
-        and content.startswith((RECOVERY_NOTICE_TEXT, LEGACY_RECOVERY_NOTICE_TEXT))
+        and content.startswith(RECOVERY_NOTICE_TEXT)
     )
+
+
+def strip_recovery_notice_for_upstream(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Cursor echoes the proxy's recovery notice back to us in later turns.
+    The notice serves as a boundary marker for the proxy, but DeepSeek must
+    not see proxy-generated prose. Return a copy with assistant prefixes
+    stripped; leave the input untouched so cache scopes/recording contexts
+    keep matching the with-prefix history that Cursor will send next time."""
+    stripped: list[dict[str, Any]] = []
+    for message in messages:
+        if message.get("role") != "assistant":
+            stripped.append(message)
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or not content.startswith(RECOVERY_NOTICE_TEXT):
+            stripped.append(message)
+            continue
+        cleaned = dict(message)
+        cleaned["content"] = content[len(RECOVERY_NOTICE_TEXT) :].lstrip("\r\n")
+        stripped.append(cleaned)
+    return stripped
 
 
 def leading_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -648,6 +714,11 @@ def assistant_needs_reasoning_for_tool_context(
 def upstream_model_for(original_model: str, config: ProxyConfig) -> str:
     if original_model.startswith("deepseek-"):
         return original_model
+    LOG.warning(
+        "rewriting non-DeepSeek model %r to configured fallback %r",
+        original_model,
+        config.upstream_model,
+    )
     return config.upstream_model
 
 
@@ -680,6 +751,18 @@ def reasoning_cache_namespace(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def response_recording_contexts(
+    *scope_pairs: tuple[str, list[dict[str, Any]]],
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    seen: set[str] = set()
+    contexts: list[tuple[str, list[dict[str, Any]]]] = []
+    for scope, msgs in scope_pairs:
+        if scope and scope not in seen:
+            seen.add(scope)
+            contexts.append((scope, msgs))
+    return contexts
+
+
 def prepare_upstream_request(
     payload: dict[str, Any],
     config: ProxyConfig,
@@ -692,6 +775,16 @@ def prepare_upstream_request(
     prepared = {
         key: value for key, value in payload.items() if key in SUPPORTED_REQUEST_FIELDS
     }
+    dropped_fields = sorted(
+        key
+        for key in payload.keys()
+        if key not in SUPPORTED_REQUEST_FIELDS
+        and key not in {"max_completion_tokens", "functions", "function_call"}
+    )
+    if dropped_fields:
+        LOG.warning(
+            "dropping unsupported request field(s): %s", ", ".join(dropped_fields)
+        )
     if "max_tokens" not in prepared and "max_completion_tokens" in payload:
         prepared["max_tokens"] = payload["max_completion_tokens"]
 
@@ -723,17 +816,12 @@ def prepare_upstream_request(
         if tool_choice is not None:
             prepared["tool_choice"] = tool_choice
 
-    if config.thinking != "pass-through":
-        prepared["thinking"] = {"type": config.thinking}
-
-    thinking = prepared.get("thinking")
-    thinking_enabled = isinstance(thinking, dict) and thinking.get("type") == "enabled"
-    thinking_disabled = (
-        isinstance(thinking, dict) and thinking.get("type") == "disabled"
-    )
+    prepared["thinking"] = {"type": config.thinking}
+    thinking_enabled = config.thinking == "enabled"
+    thinking_disabled = config.thinking == "disabled"
     if thinking_enabled:
         prepared["reasoning_effort"] = normalize_reasoning_effort(
-            prepared.get("reasoning_effort") or config.reasoning_effort
+            config.reasoning_effort
         )
 
     cache_namespace = reasoning_cache_namespace(
@@ -772,6 +860,8 @@ def prepare_upstream_request(
             keep_reasoning=not thinking_disabled,
         )
     )
+    record_response_messages = list(messages)
+    record_response_scope = conversation_scope(messages, cache_namespace)
     while missing_indexes and config.missing_reasoning_strategy == "recover":
         recovered_messages, dropped_messages, notice, recovery_step = (
             recover_messages_from_missing_reasoning(messages, missing_indexes)
@@ -796,7 +886,12 @@ def prepare_upstream_request(
             keep_reasoning=not thinking_disabled,
         )
         reasoning_diagnostics.extend(latest_diagnostics)
-    prepared["messages"] = messages
+    active_record_response_scope = conversation_scope(messages, cache_namespace)
+    record_response_contexts = response_recording_contexts(
+        (record_response_scope, record_response_messages),
+        (active_record_response_scope, messages),
+    )
+    prepared["messages"] = strip_recovery_notice_for_upstream(messages)
 
     return PreparedRequest(
         payload=prepared,
@@ -812,6 +907,9 @@ def prepare_upstream_request(
         recovery_steps=recovery_steps,
         continued_recovery_boundary=continued_recovery_boundary,
         retired_prefix_messages=retired_prefix_messages,
+        record_response_scope=record_response_scope,
+        record_response_messages=record_response_messages,
+        record_response_contexts=record_response_contexts,
     )
 
 
@@ -820,6 +918,8 @@ def record_response_reasoning(
     store: ReasoningStore | None,
     request_messages: list[dict[str, Any]],
     cache_namespace: str = "",
+    response_scope: str | None = None,
+    recording_contexts: list[tuple[str, list[dict[str, Any]]]] | None = None,
 ) -> int:
     if store is None:
         return 0
@@ -827,18 +927,28 @@ def record_response_reasoning(
     choices = response_payload.get("choices")
     if not isinstance(choices, list):
         return stored
-    response_scope = conversation_scope(request_messages, cache_namespace)
+    contexts: list[tuple[str, list[dict[str, Any]]]] = []
+    if recording_contexts:
+        contexts.extend(recording_contexts)
+    if response_scope is not None or not contexts:
+        scope = (
+            response_scope
+            if response_scope is not None
+            else conversation_scope(request_messages, cache_namespace)
+        )
+        contexts.append((scope, request_messages))
     for choice in choices:
         if not isinstance(choice, dict):
             continue
         message = choice.get("message")
         if isinstance(message, dict):
-            stored += store.store_assistant_message(
-                message,
-                response_scope,
-                cache_namespace,
-                request_messages,
-            )
+            for scope, prior_messages in contexts:
+                stored += store.store_assistant_message(
+                    message,
+                    scope,
+                    cache_namespace,
+                    prior_messages,
+                )
     return stored
 
 
@@ -849,6 +959,11 @@ def rewrite_response_body(
     request_messages: list[dict[str, Any]],
     cache_namespace: str = "",
     content_prefix: str | None = None,
+    scope: str | None = None,
+    prior_messages: list[dict[str, Any]] | None = None,
+    recording_contexts: list[tuple[str, list[dict[str, Any]]]] | None = None,
+    display_reasoning: bool = False,
+    collapsible_reasoning: bool = True,
 ) -> bytes:
     response_payload = json.loads(body.decode("utf-8"))
     if isinstance(response_payload, dict):
@@ -859,7 +974,11 @@ def rewrite_response_body(
             store,
             request_messages,
             cache_namespace,
+            response_scope=scope,
+            recording_contexts=recording_contexts,
         )
+        if display_reasoning:
+            fold_reasoning_into_content(response_payload, collapsible_reasoning)
         if "model" in response_payload:
             response_payload["model"] = original_model
     return json.dumps(

@@ -6,6 +6,7 @@ from deepseek_cursor_proxy.reasoning_store import ReasoningStore, conversation_s
 from deepseek_cursor_proxy.streaming import (
     CursorReasoningDisplayAdapter,
     StreamAccumulator,
+    fold_reasoning_into_content,
 )
 
 
@@ -298,7 +299,7 @@ class StreamAccumulatorTests(unittest.TestCase):
 
 
 class CursorReasoningDisplayAdapterTests(unittest.TestCase):
-    def test_mirrors_reasoning_content_into_think_tagged_content(self) -> None:
+    def test_mirrors_reasoning_content_into_details_content(self) -> None:
         adapter = CursorReasoningDisplayAdapter()
         reasoning_chunk = {
             "id": "chatcmpl-stream",
@@ -329,8 +330,43 @@ class CursorReasoningDisplayAdapterTests(unittest.TestCase):
         reasoning_delta = reasoning_chunk["choices"][0]["delta"]
         answer_delta = answer_chunk["choices"][0]["delta"]
         self.assertEqual(reasoning_delta["reasoning_content"], "Need context.")
-        self.assertEqual(reasoning_delta["content"], "<think>\nNeed context.")
-        self.assertEqual(answer_delta["content"], "\n</think>\n\nFinal answer.")
+        self.assertEqual(
+            reasoning_delta["content"],
+            "<details>\n<summary>Thinking</summary>\n\nNeed context.",
+        )
+        self.assertEqual(answer_delta["content"], "\n</details>\n\nFinal answer.")
+
+    def test_can_mirror_reasoning_content_into_legacy_think_content(self) -> None:
+        adapter = CursorReasoningDisplayAdapter(collapsible=False)
+        reasoning_chunk = {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"reasoning_content": "Need context."},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        answer_chunk = {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": "Final answer."},
+                    "finish_reason": None,
+                }
+            ],
+        }
+
+        adapter.rewrite_chunk(reasoning_chunk)
+        adapter.rewrite_chunk(answer_chunk)
+
+        self.assertEqual(
+            reasoning_chunk["choices"][0]["delta"]["content"], "<think>\nNeed context."
+        )
+        self.assertEqual(
+            answer_chunk["choices"][0]["delta"]["content"],
+            "\n</think>\n\nFinal answer.",
+        )
 
     def test_closes_thinking_block_before_tool_calls(self) -> None:
         adapter = CursorReasoningDisplayAdapter()
@@ -364,7 +400,9 @@ class CursorReasoningDisplayAdapterTests(unittest.TestCase):
 
         adapter.rewrite_chunk(tool_chunk)
 
-        self.assertEqual(tool_chunk["choices"][0]["delta"]["content"], "\n</think>\n\n")
+        self.assertEqual(
+            tool_chunk["choices"][0]["delta"]["content"], "\n</details>\n\n"
+        )
 
     def test_flush_chunk_closes_unfinished_thinking_block_at_done(self) -> None:
         adapter = CursorReasoningDisplayAdapter()
@@ -388,9 +426,48 @@ class CursorReasoningDisplayAdapterTests(unittest.TestCase):
         assert closing_chunk is not None
         self.assertEqual(closing_chunk["model"], "deepseek-v4-pro")
         self.assertEqual(
-            closing_chunk["choices"][0]["delta"]["content"], "\n</think>\n\n"
+            closing_chunk["choices"][0]["delta"]["content"], "\n</details>\n\n"
         )
         self.assertIsNone(adapter.flush_chunk("deepseek-v4-pro"))
+
+
+class FoldReasoningTests(unittest.TestCase):
+    def test_fold_reasoning_into_non_streaming_content(self) -> None:
+        """Non-streaming responses mirror reasoning_content into a visible
+        <details> block, matching the streaming layout."""
+        payload = {
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "answer",
+                        "reasoning_content": "thinking",
+                    },
+                }
+            ]
+        }
+        fold_reasoning_into_content(payload, collapsible=True)
+        self.assertEqual(
+            payload["choices"][0]["message"]["content"],
+            "<details>\n<summary>Thinking</summary>\n\nthinking\n</details>\n\nanswer",
+        )
+
+    def test_fold_reasoning_skips_empty_reasoning(self) -> None:
+        payload = {
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "answer",
+                        "reasoning_content": "",
+                    },
+                }
+            ]
+        }
+        fold_reasoning_into_content(payload, collapsible=True)
+        self.assertEqual(payload["choices"][0]["message"]["content"], "answer")
 
 
 if __name__ == "__main__":
