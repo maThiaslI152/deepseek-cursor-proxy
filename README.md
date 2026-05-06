@@ -5,6 +5,21 @@ A compatibility proxy that connects Cursor to DeepSeek thinking models (`deepsee
 
 This proxy can also help **other applications and coding agents** beyond Cursor that run into the same missing `reasoning_content` issue with DeepSeek's thinking-mode API. Just point their API base URL at the proxy.
 
+## Fork Improvements
+
+This is a fork of the original [deepseek-cursor-proxy](https://github.com/yxlao/deepseek-cursor-proxy) by yxlao, with the following improvements focused on long-session continuity and performance:
+
+- **Cache schema v2 with deduplication** — `reasoning_content` text is stored once (SHA-256 keyed) and referenced from cache keys, eliminating redundant storage when the same reasoning text has multiple lookup keys.
+- **Single-query batch lookup** — Cache lookups use a single `SELECT ... WHERE key IN (...)` query instead of up to ~15 individual queries per message, reducing TTFT after context resets by ~10-50ms.
+- **WAL mode + SQLite pragmas** — Enables concurrent readers without blocking on writes, critical for multi-threaded proxy throughput.
+- **Cache warming on context reset** — When Cursor truncates conversation history (~200K limit), the proxy pre-writes scope keys after a namespace hit, so the next turn resolves at Priority 1 with zero wasted lookups.
+- **Console cache metrics** — Displays the proxy's own `reasoning_content` cache hit rate (`proxy_cache`) alongside DeepSeek's prompt cache hit rate (`api_cache`) in the stats line, giving visibility into cache effectiveness across context resets.
+- **Default reasoning effort set to `max`** — Maximizes DeepSeek thinking depth out of the box.
+- **Graceful shutdown with active-request draining** — Waits for in-flight requests to complete before exiting.
+- **Concurrent request deduplication** — Non-streaming requests with identical payloads are coalesced, reducing redundant upstream calls.
+- **Request concurrency limit** — Configurable `max_concurrent_requests` with a semaphore to prevent upstream overload.
+- **Pre-commit hooks integrated** — Black and ruff formatting enforced via `.pre-commit-config.yaml`.
+
 ## What It Does
 
 - ✅ Injects `reasoning_content` into outgoing tool-call requests since Cursor does not include the field, restoring previously cached reasoning from regular and streamed DeepSeek responses. See [DeepSeek docs](https://api-docs.deepseek.com/guides/thinking_mode#tool-calls) for more details.
@@ -136,8 +151,9 @@ Select `deepseek-v4-pro` in Cursor and use chat or agent mode as usual.
 
 - **Core fix:** DeepSeek [thinking-mode tool calls](https://api-docs.deepseek.com/guides/thinking_mode#tool-calls) require the complete **multi-round** `reasoning_content` chain to be sent back in later requests. Cursor omits that field, causing a 400 error. The proxy (`Cursor -> ngrok -> proxy -> DeepSeek API`) stores DeepSeek's original `reasoning_content` and patches missing blocks back into outgoing tool-call history.
 - **Multi-conversation isolation:** To avoid collisions across concurrent conversations, the proxy scopes cache keys by a SHA-256 hash of the canonical conversation prefix (roles, content, and tool calls, excluding `reasoning_content`) plus the upstream model, configuration, and an API-key hash. Different threads get different scopes, so reused tool-call IDs do not collide. Byte-identical cloned histories produce identical scopes.
-- **Context caching compatibility:** The proxy preserves compatibility by never injecting synthetic thread IDs, timestamps, or cache-control messages. It restores `reasoning_content` as the exact original string, so repeated prefixes remain intact for [DeepSeek context cache](https://api-docs.deepseek.com/guides/kv_cache). Cache hit rates are logged in the terminal output.
-- **Additional compatibility fixes:** Beyond reasoning repair, the proxy converts legacy `functions`/`function_call` fields to `tools`/`tool_choice`, preserves required and named tool-choice semantics, normalizes `reasoning_effort` aliases, strips mirrored thinking display blocks from assistant content, flattens multi-part content arrays to plain text, and mirrors `reasoning_content` into Cursor-visible Markdown details blocks.
+- **Efficient cache (schema v2):** `reasoning_content` text is stored in a separate normalized table keyed by SHA-256 hash. Cache keys reference the hash, eliminating duplication when the same text is indexed under multiple key types (scope, portable, namespace). Lookups use a single batched query instead of per-key round-trips.
+- **Context caching compatibility:** The proxy preserves compatibility by never injecting synthetic thread IDs, timestamps, or cache-control messages. It restores `reasoning_content` as the exact original string, so repeated prefixes remain intact for [DeepSeek context cache](https://api-docs.deepseek.com/guides/kv_cache). Cache hit rates for both DeepSeek's prompt cache and the proxy's own reasoning cache are logged in the terminal output.
+- **Additional compatibility fixes:** Beyond reasoning repair, the proxy converts legacy `functions`/`function_call` fields to `tools`/`tool_choice`, preserves required and named tool-choice semantics, normalizes `reasoning_effort` aliases, strips mirrored thinking display blocks from assistant content, flattens multi-part content arrays to plain text, and mirrors `reasoning_content` into Cursor-visible Markdown details blocks. The proxy also deduplicates concurrent non-streaming requests and limits concurrent upstream requests via a configurable semaphore.
 
 ## Development
 
