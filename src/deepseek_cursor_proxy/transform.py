@@ -289,14 +289,27 @@ def normalize_message(
                 )
                 hit_kind = None
                 if needs_reasoning and store is not None:
-                    for lookup_key in lookup_keys:
-                        restored = store.get(str(lookup_key["key"]))
-                        if restored is not None:
-                            lookup_key["hit"] = True
-                            hit_kind = lookup_key["kind"]
-                            normalized["reasoning_content"] = restored
-                            patched = True
-                            break
+                    all_keys = [lk["key"] for lk in lookup_keys]
+                    matched_key, restored = store.batch_lookup(all_keys)
+                    if restored is not None:
+                        for lk in lookup_keys:
+                            if lk["key"] == matched_key:
+                                lk["hit"] = True
+                                hit_kind = lk["kind"]
+                                break
+                        normalized["reasoning_content"] = restored
+                        patched = True
+                        # Cache warming: a namespace hit means context was
+                        # reset. Pre-write scope + portable keys so the
+                        # next turn hits at Priority 1 (zero wasted lookups).
+                        if hit_kind and hit_kind.startswith("namespace_"):
+                            store.warm_cache(
+                                normalized,
+                                restored,
+                                lookup_scope,
+                                cache_namespace,
+                                prior_messages,
+                            )
                 if needs_reasoning and not patched:
                     missing = True
                 if needs_reasoning:

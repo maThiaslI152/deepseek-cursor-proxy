@@ -33,21 +33,29 @@ The proxy caches `reasoning_content` from DeepSeek responses in a local SQLite d
 
 ## Module Breakdown
 
-### `server.py` — HTTP Server & Request Handler (~1280 lines)
+### `server.py` — HTTP Server & Request Handler (~1290 lines)
 
 The entry point and main orchestrator.
 
-- **`DeepSeekProxyServer`** — Subclass of `ThreadingHTTPServer`. Holds shared state: `config`, `reasoning_store`, and `trace_writer`.
+- **`DeepSeekProxyServer`** — Subclass of `ThreadingHTTPServer`. Holds shared state: `config`, `reasoning_store`, `trace_writer`, and `RequestMetrics` (tracks cache hit/miss, latency, success/failure counts).
 - **`DeepSeekProxyHandler`** — Subclass of `BaseHTTPRequestHandler`. Handles all HTTP verbs:
-  - `do_GET()` — Health check (`/healthz`) and model listing (`/models`)
+  - `do_GET()` — Health check (`/healthz`) and model listing (`/models`). `/healthz` exposes metrics snapshot.
   - `do_POST()` — Main pipeline for `/chat/completions`:
     1. Parse JSON body and validate auth
     2. Call `prepare_upstream_request()` to transform the request
     3. Forward to DeepSeek API via `urllib.request.urlopen()`
     4. Proxy response back via `_proxy_streaming_response()` or `_proxy_regular_response()`
+    5. `RequestMetrics.record()` updates hit/miss counters for each completed request
   - `do_OPTIONS()` — CORS preflight handling
 - **`main()`** — Entry point: loads config, applies CLI overrides, initializes store/traces, optionally starts ngrok, starts the server.
-- **Logging helpers** — Unicode box-drawing format for structured terminal output (cursor request → context → send → stats).
+- **Logging helpers** — Unicode box-drawing format for structured terminal output:
+  ```
+  ┌ cursor  model=deepseek-v4-flash messages=42 tools=8
+  ├ context status=ok reasoning_context=5
+  ├ send    user_msgs=3 messages=42 tools=8 reasoning_content=5
+  └ stats   prompt=12,345 output=5,678 reasoning=1,234 api_cache=72.3% proxy_cache=85%
+  ```
+  The `proxy_cache` field shows the proxy's own reasoning_content cache hit rate (across all requests since startup), distinct from DeepSeek's API-side prompt cache hit rate (`api_cache`).
 
 ### `config.py` — Configuration Management (~270 lines)
 
@@ -83,20 +91,29 @@ The core compatibility layer.
   - Stage-based deduplication prevents re-storing already-cached reasoning
 - **`CursorReasoningDisplayAdapter`** — Mirrors `reasoning_content` into `content` wrapped in `<think>...</think>` tags so Cursor displays the thinking tokens in its UI. Tracks open/close state per choice index.
 
-### `reasoning_store.py` — SQLite Cache (~350 lines)
+### `reasoning_store.py` — SQLite Cache (~430 lines)
 
-Thread-safe SQLite-backed cache for reasoning content.
+Thread-safe SQLite-backed cache for reasoning content, using schema v2 for deduplication and WAL mode for concurrent performance.
 
+- **Schema v2** — Two normalized tables:
+  - `reasoning_texts(hash, reasoning, created_at)` — Stores reasoning content once, keyed by SHA-256 hash
+  - `reasoning_cache(key, reasoning_hash, created_at)` — Maps cache keys to reasoning text via hash reference
+  - This eliminates the per-key duplication of reasoning text (previously N rows × full text per assistant message)
+- **WAL mode + pragmas** — `PRAGMA journal_mode=WAL`, `synchronous=NORMAL`, `mmap_size=256MB`, `cache_size=64MB`. WAL enables concurrent readers without blocking on writes, critical for the threaded proxy.
 - **`ReasoningStore`** — Core store with methods:
-  - `put()` / `get()` — Basic CRUD
-  - `clear()` — Delete all rows
-  - `prune()` — Remove rows exceeding max age or max row count
-  - `store_assistant_message()` — Store reasoning under all key types (scope, portable, namespace)
-  - `lookup_for_message()` — Priority-ordered lookup: scope → portable → namespace keys
+  - `put()` / `get()` — Basic CRUD (v2-aware with hash dedup)
+  - `batch_lookup(keys)` — **Single SQL query** replacing up to ~15 individual SELECTs:
+    - Uses `WHERE key IN (...)` with `ORDER BY CASE` to maintain caller priority ordering
+    - Eliminates lock acquisition overhead of N separate round-trips
+  - `store_assistant_message()` — Batch `executemany` INSERT instead of N individual `put()` calls
+  - `warm_cache()` — Pre-writes scope + portable keys when a namespace key hits (context reset detected), so the next turn hits at Priority 1
+  - `lookup_for_message()` — Priority-ordered lookup, now delegates to `batch_lookup()`
+  - `clear()` — Clears both tables
+  - `prune()` — Age/row-limit cleanup with orphaned reasoning_texts removal
 - **Key types (priority order on lookup):**
   - `scope:{scope}:{type}:{id}` — Exact conversation scope (priority 1)
   - `namespace:{ns}:turn:{turn_sig}:{type}:{id}` — Portable turn-context keys (priority 2)
-  - `namespace:{ns}:{type}:{id}` — Broad namespace keys, survices Cursor context resets (priority 3)
+  - `namespace:{ns}:{type}:{id}` — Broad namespace keys, survives Cursor context resets (priority 3)
 - **`conversation_scope()`** — SHA-256 of canonical conversation prefix (roles + content + tool calls, excluding reasoning_content)
 - **`namespace_reasoning_keys()`** — Broad keys keyed only by API config + message content, allowing recall across arbitrary conversations
 - **`message_signature()`**, **`tool_call_signature()`**, **`turn_context_signature()`** — Hashing utilities
@@ -139,6 +156,14 @@ Thread-safe SQLite-backed cache for reasoning content.
 7. **Dual response handling** — Streaming and non-streaming responses use different code paths:
    - Streaming: SSE chunks are accumulated and stored incrementally (tool-call detection triggers early storage)
    - Non-streaming: The full response is decoded, processed, and stored in one pass
+
+8. **Single-query batch lookup** — When patching reasoning into an upstream request, the proxy previously iterated through ~15 cache keys per assistant message, each requiring an individual SQLite SELECT query. For a 10-message conversation, that was ~150 round-trips. The `batch_lookup()` method collapses this into a single `SELECT ... WHERE key IN (...) ORDER BY CASE ... LIMIT 1`, improving TTFT after context resets by ~10-50ms.
+
+9. **Cache warming on context reset** — When Cursor truncates conversation history (around 200K tokens), the proxy's scope keys (Priority 1) and portable keys (Priority 2) all miss because the conversation prefix changed. The namespace keys (Priority 3) still hit because they depend only on message content + API config. After a namespace hit, `warm_cache()` pre-writes scope + portable keys for the current conversation, so the *next* turn hits at Priority 1 — zero wasted lookups.
+
+10. **Schema v2 deduplication** — Each assistant message's `reasoning_content` is stored under ~11-15 different cache keys (scope + portable + namespace × signature + tool_call_id + tool_call_signature + tool_name). V1 stored the full reasoning text in every row. V2 normalizes reasoning text into a separate `reasoning_texts` table keyed by SHA-256 hash, with `reasoning_cache` referencing the hash. This eliminates redundant storage and keeps the cache table lean for faster scans.
+
+11. **WAL mode for concurrent access** — The `ThreadingHTTPServer` dispatches requests across threads. WAL mode allows readers to proceed without blocking writers, preventing lock contention when one thread is recording a response while another is looking up cached reasoning for the next request.
 
 ## Configuration
 

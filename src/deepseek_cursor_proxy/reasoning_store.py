@@ -207,7 +207,7 @@ def namespace_reasoning_keys(
     return keys
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SCHEMA_META_TABLE = "reasoning_cache_meta"
 
 
@@ -233,14 +233,34 @@ class ReasoningStore:
         )
         if isinstance(self.reasoning_content_path, Path):
             self.reasoning_content_path.chmod(0o600)
+
+        # Performance pragmas: WAL for concurrent reads, mmap for fast access
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA mmap_size=268435456")
+        self._conn.execute("PRAGMA cache_size=-64000")
+
+        # Create v2 data tables (IF NOT EXISTS so existing v1 tables are
+        # preserved for migration; _migrate handles replacement).
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS reasoning_texts (
+                hash TEXT PRIMARY KEY,
+                reasoning TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+        """)
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS reasoning_cache (
                 key TEXT PRIMARY KEY,
-                reasoning TEXT NOT NULL,
-                message_json TEXT NOT NULL,
+                reasoning_hash TEXT NOT NULL,
                 created_at REAL NOT NULL
             )
-            """)
+        """)
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_reasoning_cache_created
+            ON reasoning_cache(created_at)
+        """)
+
         self._init_schema()
         self._migrate()
         self.prune()
@@ -260,11 +280,13 @@ class ReasoningStore:
                 value TEXT NOT NULL
             )
             """)
+        # Only insert version on fresh DB — do NOT overwrite existing versions
+        # so that _migrate can detect the old version and upgrade.
         self._conn.execute(
             f"""
             INSERT INTO {SCHEMA_META_TABLE}(key, value)
             VALUES ('schema_version', ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            ON CONFLICT(key) DO NOTHING
             """,
             (str(SCHEMA_VERSION),),
         )
@@ -274,13 +296,58 @@ class ReasoningStore:
         version = self.schema_version
         if version >= SCHEMA_VERSION:
             return
-        # v0→v1: No-op. Old scope-only keys remain valid for their original
-        # conversations. The new namespace keys are written on subsequent
-        # store_assistant_message calls; the cache self-heals within one
-        # session. Schema version tracking ensures future migrations have
-        # a known starting point.
-        self._set_meta("schema_version", str(SCHEMA_VERSION))
-        self._conn.commit()
+
+        if version == 1:
+            # v1→v2: Normalize reasoning_text into separate table to
+            # eliminate row-count blowup (each assistant message was stored
+            # under N keys with full reasoning text duplicated N times).
+            columns = [
+                row[1]
+                for row in self._conn.execute(
+                    "PRAGMA table_info(reasoning_cache)"
+                ).fetchall()
+            ]
+            if "reasoning" in columns:
+                old_rows = self._conn.execute(
+                    "SELECT key, reasoning, created_at FROM reasoning_cache"
+                ).fetchall()
+
+                self._conn.execute("DROP TABLE IF EXISTS reasoning_cache")
+                self._conn.execute("""
+                    CREATE TABLE reasoning_cache (
+                        key TEXT PRIMARY KEY,
+                        reasoning_hash TEXT NOT NULL,
+                        created_at REAL NOT NULL
+                    )
+                """)
+
+                seen: set[str] = set()
+                for key, reasoning, created_at in old_rows:
+                    hash_val = hashlib.sha256(
+                        reasoning.encode("utf-8")
+                    ).hexdigest()
+                    if hash_val not in seen:
+                        self._conn.execute(
+                            "INSERT OR IGNORE INTO reasoning_texts"
+                            "(hash, reasoning, created_at) VALUES (?, ?, ?)",
+                            (hash_val, reasoning, created_at),
+                        )
+                        seen.add(hash_val)
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO reasoning_cache"
+                        "(key, reasoning_hash, created_at) VALUES (?, ?, ?)",
+                        (key, hash_val, created_at),
+                    )
+
+            self._set_meta("schema_version", str(SCHEMA_VERSION))
+            self._conn.commit()
+            return
+
+        if version == 0:
+            # v0→v1: No-op, bump version to enable v1→v2 migration
+            self._set_meta("schema_version", "1")
+            self._conn.commit()
+            return self._migrate()
 
     def _set_meta(self, key: str, value: str) -> None:
         self._conn.execute(
@@ -296,34 +363,75 @@ class ReasoningStore:
         with self._lock:
             self._conn.close()
 
-    def put(self, key: str, reasoning: str, message: dict[str, Any]) -> None:
+    def _reasoning_hash(self, reasoning: str) -> str:
+        return hashlib.sha256(reasoning.encode("utf-8")).hexdigest()
+
+    def put(self, key: str, reasoning: str, message: dict[str, Any] | None = None) -> None:
+        """Store a single key→reasoning mapping (backward-compatible convenience)."""
         if not isinstance(reasoning, str):
             return
-        message_json = json.dumps(message, ensure_ascii=False, sort_keys=True)
+        now = time.time()
+        hash_val = self._reasoning_hash(reasoning)
         with self._lock:
             self._conn.execute(
-                """
-                INSERT INTO reasoning_cache(key, reasoning, message_json, created_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(key) DO UPDATE SET
-                    reasoning = excluded.reasoning,
-                    message_json = excluded.message_json,
-                    created_at = excluded.created_at
-                """,
-                (key, reasoning, message_json, time.time()),
+                "INSERT OR IGNORE INTO reasoning_texts"
+                "(hash, reasoning, created_at) VALUES (?, ?, ?)",
+                (hash_val, reasoning, now),
+            )
+            self._conn.execute(
+                "INSERT OR REPLACE INTO reasoning_cache"
+                "(key, reasoning_hash, created_at) VALUES (?, ?, ?)",
+                (key, hash_val, now),
             )
             self._prune_locked()
             self._conn.commit()
 
     def get(self, key: str) -> str | None:
+        """Retrieve reasoning text by cache key (single-key lookup)."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT reasoning FROM reasoning_cache WHERE key = ?",
+                """
+                SELECT rt.reasoning
+                FROM reasoning_cache rc
+                JOIN reasoning_texts rt ON rc.reasoning_hash = rt.hash
+                WHERE rc.key = ?
+                """,
                 (key,),
             ).fetchone()
         if row is None:
             return None
         return str(row[0])
+
+    def batch_lookup(self, keys: list[str]) -> tuple[str | None, str | None]:
+        """Try all keys in priority order, return (matched_key, reasoning).
+
+        Uses a single query with ORDER BY CASE to maintain caller priority
+        ordering, eliminating up to ~15 individual SELECT round-trips per
+        message lookup.
+        """
+        if not keys:
+            return (None, None)
+        placeholders = ",".join("?" for _ in keys)
+        case_expr = (
+            "CASE key "
+            + " ".join(f"WHEN ? THEN {i}" for i in range(len(keys)))
+            + " END"
+        )
+        with self._lock:
+            row = self._conn.execute(
+                f"""
+                SELECT rc.key, rt.reasoning
+                FROM reasoning_cache rc
+                JOIN reasoning_texts rt ON rc.reasoning_hash = rt.hash
+                WHERE rc.key IN ({placeholders})
+                ORDER BY {case_expr}
+                LIMIT 1
+                """,
+                keys + keys,
+            ).fetchone()
+        if row is None:
+            return (None, None)
+        return (str(row[0]), str(row[1]))
 
     def store_assistant_message(
         self,
@@ -332,6 +440,11 @@ class ReasoningStore:
         cache_namespace: str = "",
         prior_messages: list[dict[str, Any]] | None = None,
     ) -> int:
+        """Store reasoning for an assistant message under all relevant key types.
+
+        Uses a single batched INSERT instead of N individual put() calls,
+        with deduplicated reasoning text via the reasoning_texts table.
+        """
         if message.get("role") != "assistant":
             return 0
         reasoning = message.get("reasoning_content")
@@ -346,8 +459,24 @@ class ReasoningStore:
                 portable_reasoning_keys(message, cache_namespace, prior_messages)
             )
         keys = list(dict.fromkeys(keys))
-        for key in keys:
-            self.put(key, reasoning, message)
+        if not keys:
+            return 0
+
+        now = time.time()
+        hash_val = self._reasoning_hash(reasoning)
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO reasoning_texts"
+                "(hash, reasoning, created_at) VALUES (?, ?, ?)",
+                (hash_val, reasoning, now),
+            )
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO reasoning_cache"
+                "(key, reasoning_hash, created_at) VALUES (?, ?, ?)",
+                [(key, hash_val, now) for key in keys],
+            )
+            self._prune_locked()
+            self._conn.commit()
         return len(keys)
 
     def lookup_for_message(
@@ -357,8 +486,10 @@ class ReasoningStore:
         cache_namespace: str = "",
         prior_messages: list[dict[str, Any]] | None = None,
     ) -> str | None:
+        """Priority-ordered cache lookup using the batched query."""
+        keys: list[str] = []
         # Priority 1: exact conversation scope keys
-        keys = scoped_reasoning_keys(message, scope)
+        keys.extend(scoped_reasoning_keys(message, scope))
         # Priority 2: portable turn-context keys (same tail, different prefix)
         if prior_messages is not None:
             keys.extend(
@@ -367,11 +498,59 @@ class ReasoningStore:
         # Priority 3: broad namespace keys (any conversation, same API config)
         if cache_namespace:
             keys.extend(namespace_reasoning_keys(message, cache_namespace))
-        for key in keys:
-            reasoning = self.get(key)
-            if reasoning is not None:
-                return reasoning
-        return None
+
+        _, reasoning = self.batch_lookup(keys)
+        return reasoning
+
+    def warm_cache(
+        self,
+        message: dict[str, Any],
+        reasoning: str,
+        scope: str,
+        cache_namespace: str = "",
+        prior_messages: list[dict[str, Any]] | None = None,
+    ) -> int:
+        """Warm cache by pre-writing scope + portable keys on a namespace hit.
+
+        After a context reset triggers a Priority 3 (namespace) hit, this
+        ensures the *next* turn in the same conversation hits at Priority 1
+        (scope) — zero wasted lookups.
+        """
+        if not isinstance(reasoning, str):
+            return 0
+        message_with_reasoning = dict(message)
+        message_with_reasoning["reasoning_content"] = reasoning
+
+        keys = list(
+            dict.fromkeys(
+                scoped_reasoning_keys(message_with_reasoning, scope)
+                + (
+                    portable_reasoning_keys(
+                        message_with_reasoning, cache_namespace, prior_messages
+                    )
+                    if prior_messages is not None
+                    else []
+                )
+            )
+        )
+        if not keys:
+            return 0
+
+        now = time.time()
+        hash_val = self._reasoning_hash(reasoning)
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO reasoning_texts"
+                "(hash, reasoning, created_at) VALUES (?, ?, ?)",
+                (hash_val, reasoning, now),
+            )
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO reasoning_cache"
+                "(key, reasoning_hash, created_at) VALUES (?, ?, ?)",
+                [(key, hash_val, now) for key in keys],
+            )
+            self._conn.commit()
+        return len(keys)
 
     def backfill_portable_aliases(
         self,
@@ -387,15 +566,32 @@ class ReasoningStore:
             return 0
         message_with_reasoning = dict(message)
         message_with_reasoning["reasoning_content"] = reasoning
-        for key in dict.fromkeys(keys):
-            self.put(key, reasoning, message_with_reasoning)
+        keys = list(dict.fromkeys(keys))
+
+        now = time.time()
+        hash_val = self._reasoning_hash(reasoning)
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO reasoning_texts"
+                "(hash, reasoning, created_at) VALUES (?, ?, ?)",
+                (hash_val, reasoning, now),
+            )
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO reasoning_cache"
+                "(key, reasoning_hash, created_at) VALUES (?, ?, ?)",
+                [(key, hash_val, now) for key in keys],
+            )
+            self._conn.commit()
         return len(keys)
 
     def clear(self) -> int:
         with self._lock:
-            row = self._conn.execute("SELECT COUNT(*) FROM reasoning_cache").fetchone()
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM reasoning_cache"
+            ).fetchone()
             count = int(row[0] if row else 0)
             self._conn.execute("DELETE FROM reasoning_cache")
+            self._conn.execute("DELETE FROM reasoning_texts")
             self._conn.commit()
         return count
 
@@ -429,4 +625,13 @@ class ReasoningStore:
                 (self.max_rows,),
             )
             deleted += cursor.rowcount if cursor.rowcount != -1 else 0
+
+        # Clean up orphaned reasoning_texts entries (no remaining cache refs)
+        cursor = self._conn.execute("""
+            DELETE FROM reasoning_texts
+            WHERE hash NOT IN (
+                SELECT DISTINCT reasoning_hash FROM reasoning_cache
+            )
+        """)
+        deleted += cursor.rowcount if cursor.rowcount != -1 else 0
         return deleted

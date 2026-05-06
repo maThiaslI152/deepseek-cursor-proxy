@@ -15,6 +15,7 @@ from .config import (
     default_reasoning_content_path,
 )
 from .log_format import LOG
+from .logging import configure_logging
 from .reasoning_store import ReasoningStore
 from .trace import TraceWriter
 from .tunnel import NgrokTunnel, local_tunnel_target
@@ -84,7 +85,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--display-reasoning",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Mirror reasoning_content into Cursor-visible <think> content",
+        help="Mirror reasoning_content into Cursor-visible content",
+    )
+    parser.add_argument(
+        "--collapsible-reasoning",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use Markdown details for mirrored reasoning when display is enabled",
+    )
+    # Support typo aliases for backward compatibility if needed, though cli.py is relatively new
+    parser.add_argument(
+        "--collasible-reasoning",
+        dest="collapsible_reasoning",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--cors",
@@ -144,15 +159,11 @@ def warn_if_insecure_upstream(url: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    from .server import DeepSeekProxyHandler, DeepSeekProxyServer
-
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
-    )
     args = build_arg_parser().parse_args(argv)
     try:
         config = ProxyConfig.from_file(config_path=args.config_path)
     except ValueError as exc:
+        configure_logging(verbose=bool(args.verbose))
         LOG.error("%s", exc)
         return 2
     updates: dict[str, Any] = {}
@@ -177,7 +188,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.trace_dir is not None:
         updates["trace_dir"] = args.trace_dir
     if args.display_reasoning is not None:
-        updates["cursor_display_reasoning"] = args.display_reasoning
+        updates["display_reasoning"] = args.display_reasoning
+    if args.collapsible_reasoning is not None:
+        updates["collapsible_reasoning"] = args.collapsible_reasoning
     if args.cors is not None:
         updates["cors"] = args.cors
     if args.request_timeout is not None:
@@ -197,6 +210,7 @@ def main(argv: list[str] | None = None) -> int:
     if updates:
         config = replace(config, **updates)
 
+    configure_logging(verbose=config.verbose)
     warn_if_insecure_upstream(config.upstream_base_url)
     store = ReasoningStore(
         config.reasoning_content_path,
@@ -216,41 +230,16 @@ def main(argv: list[str] | None = None) -> int:
             LOG.error("failed to initialize trace directory: %s", exc)
             store.close()
             return 2
+    from .server import DeepSeekProxyHandler, DeepSeekProxyServer
+
     server = DeepSeekProxyServer((config.host, config.port), DeepSeekProxyHandler)
     server.config = config
     server.reasoning_store = store
     server.trace_writer = trace_writer
     server.concurrency_semaphore = threading.Semaphore(config.max_concurrent_requests)
 
-    LOG.info("listening on http://%s:%s/v1", config.host, config.port)
-    LOG.info(
-        "forwarding to %s/chat/completions default_model=%s",
-        config.upstream_base_url,
-        config.upstream_model,
-    )
-    LOG.info(
-        (
-            "thinking=%s reasoning_effort=%s cursor_display_reasoning=%s "
-            "missing_reasoning_strategy=%s reasoning_content_path=%s"
-        ),
-        config.thinking,
-        config.reasoning_effort,
-        config.cursor_display_reasoning,
-        config.missing_reasoning_strategy,
-        config.reasoning_content_path,
-    )
-    if config.verbose:
-        LOG.info("logging mode=verbose metadata=detailed bodies=true")
-        LOG.warning(
-            "verbose logging enabled; prompts and code may be written to stdout"
-        )
-    else:
-        LOG.info("logging mode=normal metadata=safe_summaries bodies=false")
-    if trace_writer is not None:
-        LOG.info("trace session directory: %s", trace_writer.session_dir)
-        LOG.warning("trace logging enabled; prompts and code will be written to disk")
-
     tunnel: NgrokTunnel | None = None
+    public_url: str | None = None
     if config.ngrok:
         target_url = local_tunnel_target(config.host, config.port)
         tunnel = NgrokTunnel(target_url)
@@ -261,8 +250,41 @@ def main(argv: list[str] | None = None) -> int:
             server.server_close()
             store.close()
             return 2
-        LOG.info("ngrok tunnel forwarding %s -> %s", public_url, target_url)
-        LOG.info("Cursor Base URL: %s/v1", public_url.rstrip("/"))
+
+    local_base_url = f"http://{config.host}:{config.port}/v1"
+    api_base_url = (
+        f"{public_url.rstrip('/')}/v1" if public_url is not None else local_base_url
+    )
+
+    LOG.info(
+        "default_model: %s (%s, %s)",
+        config.upstream_model,
+        "thinking" if config.thinking == "enabled" else "no thinking",
+        config.reasoning_effort,
+    )
+
+    if config.verbose:
+        display_reasoning = "off"
+        if config.display_reasoning:
+            display_reasoning = (
+                "on (collapsible)" if config.collapsible_reasoning else "on"
+            )
+        LOG.info("display_reasoning: %s", display_reasoning)
+        LOG.info("missing_reasoning_strategy: %s", config.missing_reasoning_strategy)
+        LOG.info("reasoning_content_path: %s", config.reasoning_content_path)
+        LOG.info("logging mode=verbose metadata=detailed bodies=true")
+        LOG.warning(
+            "verbose logging enabled; prompts and code may be written to stdout"
+        )
+    else:
+        LOG.info("local_base_url: %s", local_base_url)
+        LOG.info("api_base_url: %s", api_base_url)
+        LOG.info("logging mode=normal metadata=safe_summaries bodies=false")
+
+    if trace_writer is not None:
+        LOG.info("trace session directory: %s", trace_writer.session_dir)
+        LOG.warning("trace logging enabled; prompts and code will be written to disk")
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:

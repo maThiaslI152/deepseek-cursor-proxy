@@ -66,8 +66,8 @@ deepseek-cursor-proxy/
 | Module | Lines | Responsibility |
 |--------|-------|----------------|
 | `server.py` | ~1280 | HTTP server, request lifecycle, CLI, logging |
-| `transform.py` | ~500 | Request normalization, reasoning patching, recovery |
-| `reasoning_store.py` | ~350 | SQLite cache for reasoning_content |
+| `transform.py` | ~500 | Request normalization, reasoning patching, recovery, batch lookup |
+| `reasoning_store.py` | ~430 | SQLite cache for reasoning_content (v2 schema, WAL, batch ops) |
 | `streaming.py` | ~300 | SSE chunk accumulation, think-block wrapping |
 | `config.py` | ~270 | Configuration loading, defaults, type coercion |
 | `trace.py` | ~120 | Structured request/response debug dumps |
@@ -151,7 +151,7 @@ Options:
 | Server | `test_server.py` | CLI parsing, response decompression, client disconnect |
 | Transform | `test_transform.py` | Request normalization, cache patching, recovery, scope isolation |
 | Streaming | `test_streaming.py` | SSE accumulation, think-block wrapping, tool-call merging |
-| Reasoning Store | `test_reasoning_store.py` | SQLite CRUD, pruning, permissions |
+| Reasoning Store | `test_reasoning_store.py` | SQLite CRUD, pruning, permissions, batch_lookup, warm_cache, dedup |
 | Tunnel | `test_tunnel.py` | ngrok URL parsing (both API versions) |
 | Trace | `test_trace.py` | File creation, sequence numbering, auth redaction |
 | End-to-End | `test_proxy_end_to_end.py` | Full lifecycle with fake upstream |
