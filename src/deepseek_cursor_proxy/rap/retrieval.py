@@ -412,8 +412,10 @@ class RetrievalLayer:
                 }
             )
 
-        # Serialize with MessagePack (Requirement 14.1: use_bin_type=True)
-        body = msgpack.packb({"points": points}, use_bin_type=True)
+        # Serialize as JSON for Qdrant REST API
+        # (MessagePack is used internally for size comparison/efficiency tracking)
+        import json as _json
+        body = _json.dumps({"points": points}).encode("utf-8")
 
         # Send to Qdrant
         collection = self._config.qdrant_collection
@@ -424,7 +426,7 @@ class RetrievalLayer:
                 response = client.put(
                     url,
                     content=body,
-                    headers={"Content-Type": "application/msgpack"},
+                    headers={"Content-Type": "application/json"},
                 )
                 response.raise_for_status()
         except (httpx.ConnectError, httpx.TimeoutException) as exc:
@@ -474,8 +476,9 @@ class RetrievalLayer:
             "with_payload": True,
         }
 
-        # Serialize with MessagePack (Requirement 14.1: use_bin_type=True)
-        body = msgpack.packb(search_request, use_bin_type=True)
+        # Serialize as JSON for Qdrant REST API
+        import json as _json
+        body = _json.dumps(search_request).encode("utf-8")
 
         collection = self._config.qdrant_collection
         url = f"{self._config.qdrant_url}/collections/{collection}/points/search"
@@ -485,7 +488,7 @@ class RetrievalLayer:
                 response = client.post(
                     url,
                     content=body,
-                    headers={"Content-Type": "application/msgpack"},
+                    headers={"Content-Type": "application/json"},
                 )
                 response.raise_for_status()
         except (httpx.ConnectError, httpx.TimeoutException) as exc:
@@ -561,6 +564,15 @@ class RetrievalLayer:
             try:
                 return fn(*args, **kwargs)
             except (EmbeddingUnavailableError, QdrantUnavailableError) as exc:
+                # Don't retry client errors (4xx) — they'll never succeed
+                exc_msg = str(exc)
+                if "400" in exc_msg or "401" in exc_msg or "404" in exc_msg or "422" in exc_msg:
+                    logger.warning(
+                        "Non-retryable error for %s: %s",
+                        operation,
+                        exc,
+                    )
+                    raise
                 if elapsed + delay > max_total_seconds:
                     logger.warning(
                         "Retry exhausted for %s after %.1fs: %s",

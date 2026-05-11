@@ -12,7 +12,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import httpx
-import msgpack
+import json
 import pytest
 
 from deepseek_cursor_proxy.rap.config import RAPConfig
@@ -45,8 +45,8 @@ class TestUpsertChunks:
             self.layer.upsert_chunks(chunks, embeddings)
 
     @patch("deepseek_cursor_proxy.rap.retrieval.httpx.Client")
-    def test_upsert_sends_msgpack_body(self, mock_client_cls: MagicMock) -> None:
-        """Requirement 14.1: Payloads are serialized with MessagePack use_bin_type=True."""
+    def test_upsert_sends_json_body(self, mock_client_cls: MagicMock) -> None:
+        """Requirement 14.1: Payloads are serialized as JSON for Qdrant REST API."""
         mock_response = MagicMock()
         mock_response.raise_for_status = MagicMock()
 
@@ -74,11 +74,11 @@ class TestUpsertChunks:
 
         # Verify content-type header
         headers = call_kwargs[1].get("headers", {})
-        assert headers.get("Content-Type") == "application/msgpack"
+        assert headers.get("Content-Type") == "application/json"
 
-        # Verify body is valid msgpack
+        # Verify body is valid JSON
         body = call_kwargs[1].get("content", b"")
-        decoded = msgpack.unpackb(body, raw=False)
+        decoded = json.loads(body)
         assert "points" in decoded
         assert len(decoded["points"]) == 1
 
@@ -113,7 +113,7 @@ class TestUpsertChunks:
 
         call_kwargs = mock_client.put.call_args
         body = call_kwargs[1].get("content", b"")
-        decoded = msgpack.unpackb(body, raw=False)
+        decoded = json.loads(body)
         assert len(decoded["points"]) == 3
 
     @patch("deepseek_cursor_proxy.rap.retrieval.httpx.Client")
@@ -138,7 +138,7 @@ class TestUpsertChunks:
 
         call_kwargs = mock_client.put.call_args
         body = call_kwargs[1].get("content", b"")
-        decoded = msgpack.unpackb(body, raw=False)
+        decoded = json.loads(body)
         ids = [p["id"] for p in decoded["points"]]
         assert len(set(ids)) == 2  # All unique
 
@@ -240,8 +240,8 @@ class TestRetrieve:
         self.layer = RetrievalLayer(self.config)
 
     @patch("deepseek_cursor_proxy.rap.retrieval.httpx.Client")
-    def test_retrieve_sends_msgpack_request(self, mock_client_cls: MagicMock) -> None:
-        """Requirement 14.1: Search request is serialized with MessagePack."""
+    def test_retrieve_sends_json_request(self, mock_client_cls: MagicMock) -> None:
+        """Requirement 14.1: Search request is serialized as JSON for Qdrant REST API."""
         mock_response = MagicMock()
         mock_response.json.return_value = {"result": []}
         mock_response.raise_for_status = MagicMock()
@@ -264,11 +264,11 @@ class TestRetrieve:
 
         # Verify content-type
         headers = call_kwargs[1].get("headers", {})
-        assert headers.get("Content-Type") == "application/msgpack"
+        assert headers.get("Content-Type") == "application/json"
 
-        # Verify body is valid msgpack
+        # Verify body is valid JSON
         body = call_kwargs[1].get("content", b"")
-        decoded = msgpack.unpackb(body, raw=False)
+        decoded = json.loads(body)
         assert decoded["vector"] == [0.1, 0.2, 0.3]
         assert decoded["limit"] == 5  # default top_k
         assert decoded["with_payload"] is True
@@ -290,7 +290,7 @@ class TestRetrieve:
 
         call_kwargs = mock_client.post.call_args
         body = call_kwargs[1].get("content", b"")
-        decoded = msgpack.unpackb(body, raw=False)
+        decoded = json.loads(body)
         assert decoded["limit"] == 10
 
     @patch("deepseek_cursor_proxy.rap.retrieval.httpx.Client")
