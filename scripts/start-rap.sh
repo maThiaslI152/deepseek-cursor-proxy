@@ -24,6 +24,7 @@ QDRANT_IMAGE="docker.io/qdrant/qdrant:latest"
 LMS_PORT=1234
 EMBEDDING_MODEL="text-embedding-nomic-embed-text-v1.5-embedding"
 SECURITY_MODEL="ibm-grok4-ultrafast-coder-1b"
+SECURITY_MODEL="ibm-grok4-ultrafast-coder-1b"
 
 PROXY_HOST="127.0.0.1"
 PROXY_PORT=9000
