@@ -238,6 +238,23 @@ def main(argv: list[str] | None = None) -> int:
     server.trace_writer = trace_writer
     server.concurrency_semaphore = threading.Semaphore(config.max_concurrent_requests)
 
+    # --- RAP Pipeline integration ---
+    try:
+        from .rap.config import RAPConfig
+        from .rap.pipeline import PipelineOrchestrator
+
+        rap_config = RAPConfig(
+            upstream_base_url=config.upstream_base_url,
+            upstream_model=config.upstream_model,
+        )
+        server.rap_pipeline = PipelineOrchestrator(rap_config)
+        LOG.info("RAP pipeline initialized (phases: bridge=%s compression=%s retrieval=%s security=%s)",
+                 rap_config.phase_bridge, rap_config.phase_compression,
+                 rap_config.phase_retrieval, rap_config.phase_security)
+    except Exception as exc:
+        LOG.warning("RAP pipeline not available (continuing without): %s", exc)
+        server.rap_pipeline = None
+
     tunnel: NgrokTunnel | None = None
     public_url: str | None = None
     if config.ngrok:

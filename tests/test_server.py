@@ -31,12 +31,11 @@ from deepseek_cursor_proxy.logging import (
     TerminalSpinner,
 )
 from deepseek_cursor_proxy.reasoning_store import ReasoningStore
+from deepseek_cursor_proxy.cli import build_arg_parser
+from deepseek_cursor_proxy.log_format import read_response_body, summarize_chat_payload
 from deepseek_cursor_proxy.server import (
     DeepSeekProxyHandler,
     DeepSeekProxyServer,
-    build_arg_parser,
-    read_response_body,
-    summarize_chat_payload,
 )
 
 
@@ -127,7 +126,7 @@ class CliAndHelperTests(unittest.TestCase):
                 "--no-ngrok",
                 "--no-verbose",
                 "--no-display-reasoning",
-                "--no-collasible-resoning",
+                "--no-collapsible-reasoning",
                 "--cors",
                 "--trace-dir",
                 "/tmp/dcp-traces",
@@ -552,12 +551,10 @@ class HttpBoundaryTests(unittest.TestCase):
                 time.sleep(0.01)
         output = "\n".join(captured.output)
         self.assertEqual(status, 200)
-        self.assertIn("┌ request model=deepseek-v4-pro effort=max messages=1", output)
+        self.assertIn("┌ cursor  model=deepseek-v4-pro messages=1 tools=0", output)
         self.assertIn("├ context status=ok reasoning_context=0", output)
         self.assertIn("└ stats", output)
-        self.assertNotIn(" tools=", output)
-        self.assertNotIn("├ send", output)
-        self.assertNotIn("hi", output.split("┌ request")[1].split("\n")[0])
+        self.assertNotIn("hi", output.split("┌ cursor")[1].split("\n")[0])
         self.assertNotIn("sk-from-cursor", output)
 
     def test_verbose_logging_includes_bodies_but_redacts_api_key(self) -> None:

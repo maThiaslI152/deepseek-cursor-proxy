@@ -671,6 +671,7 @@ class CrossModeAndModelTests(unittest.TestCase):
             first_recovered.payload["messages"],
             first_recovered.cache_namespace,
             content_prefix=first_recovered.recovery_notice,
+            recording_contexts=first_recovered.record_response_contexts,
         )
         recovered_assistant = json.loads(rewritten)["choices"][0]["message"]
 

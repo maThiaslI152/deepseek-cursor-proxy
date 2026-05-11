@@ -372,6 +372,23 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         if self.config.verbose:
             log_json("upstream request body", prepared.payload)
 
+        # --- RAP Pipeline: outbound processing ---
+        rap_pipeline = getattr(self.server, "rap_pipeline", None)
+        if rap_pipeline is not None:
+            try:
+                processed = rap_pipeline.process_request(prepared.payload)
+                # Update in-place since prepared is a frozen dataclass
+                prepared.payload.clear()
+                prepared.payload.update(processed)
+                # Log RAP actions
+                actions = rap_pipeline.last_outbound_actions
+                if actions:
+                    LOG.info("├ rap     %s", " ".join(actions))
+                else:
+                    LOG.info("├ rap     pass-through")
+            except Exception as exc:
+                LOG.warning("├ rap     failed (continuing): %s", exc)
+
         upstream_body = json.dumps(
             prepared.payload, ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")
@@ -880,6 +897,28 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             )
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             LOG.warning("failed to rewrite upstream JSON response: %s", exc)
+
+        # --- RAP Pipeline: inbound processing ---
+        rap_pipeline = getattr(self.server, "rap_pipeline", None)
+        if rap_pipeline is not None:
+            try:
+                response_payload = json.loads(body.decode("utf-8"))
+                processed = rap_pipeline.process_response(response_payload)
+                body = json.dumps(
+                    processed, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+                # Check if CVE findings were annotated
+                rap_inbound_actions = []
+                for choice in processed.get("choices", []):
+                    msg = choice.get("message", {})
+                    content = msg.get("content", "")
+                    if "[CVE" in content or "[SECURITY" in content:
+                        rap_inbound_actions.append("cve_annotated")
+                        break
+                if rap_inbound_actions:
+                    LOG.info("├ rap_in  %s", " ".join(rap_inbound_actions))
+            except Exception as exc:
+                LOG.warning("├ rap_in  failed (continuing): %s", exc)
 
         if self.config.verbose:
             log_bytes("cursor response body", body)
