@@ -71,13 +71,13 @@ class RAPConfig:
 
     # Security settings
     redaction_enabled: bool = True
-    cve_scanning_enabled: bool = True
+    cve_scanning_enabled: bool = False
     audit_db_path: Path = field(
         default_factory=lambda: Path("~/.deepseek-cursor-proxy/audit.sqlite3")
     )
     entropy_threshold: float = 4.5
     security_model_url: str = "http://localhost:1234/v1/chat/completions"
-    security_model_name: str = "ibm-grok4-ultrafast-coder-1b"
+    security_model_name: str = ""
 
     # Phase control
     phase_bridge: bool = True

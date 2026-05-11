@@ -13,6 +13,7 @@ import logging
 import math
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
@@ -271,27 +272,23 @@ class RetrievalLayer:
 
         return chunks
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
-        """Generate embeddings via LM Studio endpoint.
+    def _embed_batch(self, batch_texts: list[str]) -> list[list[float]]:
+        """Embed a single batch of texts via LM Studio.
 
-        Calls the configured LM Studio ``/v1/embeddings`` endpoint to produce
-        vector embeddings for the given texts.
+        Used internally by ``embed()`` for parallel dispatch. Contains
+        NaN/Inf validation and dimensionality consistency checks.
 
         Args:
-            texts: List of text strings to embed.
+            batch_texts: Sub-batch of text strings to embed.
 
         Returns:
-            List of embedding vectors (each a list of floats).
+            List of embedding vectors for this batch.
 
         Raises:
-            EmbeddingUnavailableError: If LM Studio is unreachable or times out.
-                The pipeline should catch this to skip retrieval gracefully.
-            ValueError: If embeddings contain NaN or Inf values, or if
-                embedding dimensionality is inconsistent across the batch.
-
-        Requirements: 6.2, 6.3, 6.5, 13.2
+            EmbeddingUnavailableError: If LM Studio is unreachable.
+            ValueError: If embeddings contain NaN/Inf or dimensions mismatch.
         """
-        if not texts:
+        if not batch_texts:
             return []
 
         try:
@@ -300,7 +297,7 @@ class RetrievalLayer:
                     self._config.embedding_url,
                     json={
                         "model": self._config.embedding_model,
-                        "input": texts,
+                        "input": batch_texts,
                     },
                 )
                 response.raise_for_status()
@@ -316,14 +313,14 @@ class RetrievalLayer:
         data = response.json()
         embedding_data = data.get("data", [])
 
-        # Extract embeddings sorted by index (API may return out of order)
+        # Extract embeddings sorted by index
         embeddings: list[list[float]] = [
             item["embedding"]
             for item in sorted(embedding_data, key=lambda x: x["index"])
         ]
 
         if not embeddings:
-            return []
+            return embeddings
 
         # Validate: reject NaN or Inf values (Requirement 6.5)
         for i, embedding in enumerate(embeddings):
@@ -334,7 +331,86 @@ class RetrievalLayer:
                         f"at position {j}: {value}"
                     )
 
-        # Validate: dimensionality consistency (Requirement 6.3)
+        # Validate: dimensionality consistency within this batch
+        expected_dim = len(embeddings[0])
+        for i, embedding in enumerate(embeddings):
+            if len(embedding) != expected_dim:
+                raise ValueError(
+                    f"Embedding dimensionality mismatch: expected {expected_dim}, "
+                    f"got {len(embedding)} at index {i}"
+                )
+
+        return embeddings
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        """Generate embeddings via LM Studio endpoint with parallel dispatch.
+
+        Splits large batches into sub-batches and dispatches them concurrently
+        to better utilize LM Studio's concurrent request capacity (up to 4
+        concurrent requests). Each sub-batch is independently validated for
+        NaN/Inf and dimensionality consistency.
+
+        Args:
+            texts: List of text strings to embed.
+
+        Returns:
+            List of embedding vectors (each a list of floats), in the same
+            order as the input texts.
+
+        Raises:
+            EmbeddingUnavailableError: If LM Studio is unreachable or all
+                sub-batches fail.
+            ValueError: If embeddings contain NaN or Inf values, or if
+                embedding dimensionality is inconsistent.
+
+        Requirements: 6.2, 6.3, 6.5, 13.2
+        """
+        if not texts:
+            return []
+
+        max_batch_size = 32  # LM Studio recommended batch size
+        max_workers = 4       # LM Studio concurrent request limit
+
+        # Split into sub-batches
+        batches = [
+            texts[i : i + max_batch_size]
+            for i in range(0, len(texts), max_batch_size)
+        ]
+
+        # Single batch — no need for threading overhead
+        if len(batches) == 1:
+            return self._embed_batch(batches[0])
+
+        # Dispatch batches concurrently using ThreadPoolExecutor
+        embeddings: list[list[float]] = []
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(batches))) as pool:
+            future_to_batch = {
+                pool.submit(self._embed_batch, batch): batch_idx
+                for batch_idx, batch in enumerate(batches)
+            }
+
+            # Collect results in batch order
+            ordered_results: dict[int, list[list[float]]] = {}
+            for future in as_completed(future_to_batch):
+                batch_idx = future_to_batch[future]
+                try:
+                    result = future.result()
+                    ordered_results[batch_idx] = result
+                except EmbeddingUnavailableError:
+                    raise
+                except Exception as exc:
+                    raise ValueError(
+                        f"Embedding batch {batch_idx} failed: {exc}"
+                    ) from exc
+
+            # Flatten results preserving batch order
+            for batch_idx in sorted(ordered_results.keys()):
+                embeddings.extend(ordered_results[batch_idx])
+
+        if not embeddings:
+            return []
+
+        # Cross-batch dimensionality consistency check
         expected_dim = len(embeddings[0])
         for i, embedding in enumerate(embeddings):
             if len(embedding) != expected_dim:

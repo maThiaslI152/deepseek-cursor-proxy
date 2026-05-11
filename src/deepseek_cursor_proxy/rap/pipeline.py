@@ -8,13 +8,16 @@ Requirements: 11.1, 11.2, 11.3, 11.4, 11.5, 13.5
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
+from deepseek_cursor_proxy.log_format import count_tokens
 from deepseek_cursor_proxy.rap.config import RAPConfig
 from deepseek_cursor_proxy.rap.fidelity import FidelityConfig, FidelityModule
+from deepseek_cursor_proxy.rap.model_discovery import discover_lmstudio_models, get_chat_model, get_embedding_model
 from deepseek_cursor_proxy.rap.retrieval import RetrievalLayer
-from deepseek_cursor_proxy.rap.security import SecurityConfig, SecurityGateway
+from deepseek_cursor_proxy.rap.security import AuditEntry, SecurityConfig, SecurityGateway
 from deepseek_cursor_proxy.rap.toon import TOONEngine
 
 logger = logging.getLogger(__name__)
@@ -43,6 +46,53 @@ class PipelineOrchestrator:
         self._security: Any = None
         self._toon: Any = None
         self._retrieval: Any = None
+        self._discovered_models: Any = None
+
+        # Derive LM Studio base URL from embedding URL or security model URL
+        lm_studio_url = config.security_model_url or config.embedding_url
+        if lm_studio_url:
+            from urllib.parse import urlparse
+            parsed = urlparse(lm_studio_url)
+            lm_studio_base = f"{parsed.scheme}://{parsed.netloc}"
+        else:
+            lm_studio_base = "http://localhost:1234"
+
+        # Auto-discover models if security model name is empty or uses the fictional default
+        should_discover = (
+            not config.security_model_name
+            or config.security_model_name == "ibm-grok4-ultrafast-coder-1b"
+        )
+        if should_discover or config.embedding_model not in (None, ""):
+            try:
+                import asyncio
+                discovered = asyncio.run(discover_lmstudio_models(lm_studio_base))
+                self._discovered_models = discovered
+                if discovered.lm_studio_available:
+                    # Auto-select embedding model if needed
+                    if config.embedding_model in (None, ""):
+                        emb_model = get_embedding_model(discovered)
+                        if emb_model:
+                            logger.info("Auto-selected embedding model: %s", emb_model)
+                            # We can't modify frozen config, but we override internally
+                            object.__setattr__(config, "embedding_model", emb_model)
+
+                    # Auto-select security/chat model if CVE scanning is enabled
+                    if config.cve_scanning_enabled and config.security_model_name in ("", "ibm-grok4-ultrafast-coder-1b"):
+                        chat_model = get_chat_model(discovered)
+                        if chat_model:
+                            logger.info("Auto-selected security model: %s", chat_model)
+                            object.__setattr__(config, "security_model_name", chat_model)
+                        else:
+                            logger.warning(
+                                "CVE scanning enabled but no chat model discovered. "
+                                "Static CVE patterns will still be checked."
+                            )
+                else:
+                    logger.warning(
+                        "LM Studio model discovery failed. Using configured model names."
+                    )
+            except Exception as exc:
+                logger.warning("Model discovery failed: %s", exc)
 
         # Instantiate modules for enabled phases
         if config.phase_bridge:
@@ -57,13 +107,20 @@ class PipelineOrchestrator:
             ))
 
         if config.phase_security:
+            # Use discovered model name if configured name is empty
+            sec_model_name = config.security_model_name
+            if not sec_model_name and self._discovered_models:
+                discovered_name = get_chat_model(self._discovered_models)
+                if discovered_name:
+                    sec_model_name = discovered_name
+
             self._security = SecurityGateway(SecurityConfig(
                 redaction_enabled=config.redaction_enabled,
                 cve_scanning_enabled=config.cve_scanning_enabled,
                 audit_logging_enabled=True,
                 audit_db_path=str(config.audit_db_path),
                 local_security_model_url=config.security_model_url,
-                security_model_name=config.security_model_name,
+                security_model_name=sec_model_name if sec_model_name else config.security_model_name,
                 entropy_threshold=config.entropy_threshold,
             ))
 
@@ -98,6 +155,23 @@ class PipelineOrchestrator:
         """
         result = request
         self._last_outbound_actions: list[str] = []
+        self._last_redactions: list[Any] = []
+
+        # Track compression stats for audit logging
+        stats: dict[str, Any] = {
+            "model": request.get("model", "unknown"),
+            "baseline_tokens": 0,
+            "after_toon_tokens": 0,
+            "after_security_tokens": 0,
+            "redacted_sites": 0,
+            "redacted_chars": 0,
+        }
+
+        # Baseline token count (before any RAP processing)
+        baseline_messages = result.get("messages", [])
+        stats["baseline_tokens"] = sum(
+            count_tokens(m.get("content", "")) for m in baseline_messages if isinstance(m.get("content"), str)
+        )
 
         # Phase 1: Fidelity (header injection)
         if self._config.phase_bridge:
@@ -107,27 +181,41 @@ class PipelineOrchestrator:
 
         # Phase 2: Security (outbound redaction)
         if self._config.phase_security:
-            before = result.get("messages", [])
-            result = self._run_phase("security_outbound", self._phase_security_outbound, result)
-            # Check if any redaction happened
-            after_content = "".join(
-                m.get("content", "") for m in result.get("messages", []) if isinstance(m.get("content"), str)
-            )
-            if "[REDACTED]" in after_content:
-                self._last_outbound_actions.append("redacted")
+            try:
+                result, redactions = self._phase_security_outbound(result)
+                self._last_redactions = redactions
+                if redactions:
+                    redacted_chars = sum(r.original_length for r in redactions)
+                    stats["redacted_sites"] = len(redactions)
+                    stats["redacted_chars"] = redacted_chars
+                    self._last_outbound_actions.append(
+                        f"redacted(n={len(redactions)}, ~{redacted_chars}chars)"
+                    )
+            except Exception:
+                logger.exception(
+                    "Pipeline phase 'security_outbound' failed; skipping (graceful degradation)"
+                )
 
         # Phase 3: TOON (compression)
         if self._config.phase_compression:
-            before_size = sum(
-                len(m.get("content", "")) for m in result.get("messages", []) if isinstance(m.get("content"), str)
+            before_tokens = sum(
+                count_tokens(m.get("content", ""))
+                for m in result.get("messages", [])
+                if isinstance(m.get("content"), str)
             )
             result = self._run_phase("toon_compress", self._phase_toon_compress, result)
-            after_size = sum(
-                len(m.get("content", "")) for m in result.get("messages", []) if isinstance(m.get("content"), str)
+            after_tokens = sum(
+                count_tokens(m.get("content", ""))
+                for m in result.get("messages", [])
+                if isinstance(m.get("content"), str)
             )
-            if after_size < before_size:
-                ratio = round((1 - after_size / before_size) * 100) if before_size > 0 else 0
-                self._last_outbound_actions.append(f"compressed({ratio}%)")
+            if after_tokens < before_tokens:
+                saved = before_tokens - after_tokens
+                ratio = round((1 - after_tokens / before_tokens) * 100) if before_tokens > 0 else 0
+                stats["after_toon_tokens"] = after_tokens
+                self._last_outbound_actions.append(
+                    f"compressed(-{saved}tok, {ratio}%)"
+                )
 
         # Phase 4: Retrieval (context reduction)
         if self._config.phase_retrieval:
@@ -136,6 +224,12 @@ class PipelineOrchestrator:
             after_msgs = len(result.get("messages", []))
             if after_msgs < before_msgs:
                 self._last_outbound_actions.append(f"retrieved({before_msgs}→{after_msgs}msgs)")
+
+        # Add model name to actions
+        self._last_outbound_actions.append(f"model={stats['model']}")
+
+        # Log compression stats to audit DB
+        self._log_compression_stats(stats)
 
         return result
 
@@ -230,12 +324,16 @@ class PipelineOrchestrator:
         new_headers = self._fidelity.intercept_request(headers, body)
         return {**request, "_headers": new_headers}
 
-    def _phase_security_outbound(self, request: dict[str, Any]) -> dict[str, Any]:
-        """Security phase: scan and redact secrets from outbound payload."""
+    def _phase_security_outbound(self, request: dict[str, Any]) -> tuple[dict[str, Any], list[Any]]:
+        """Security phase: scan and redact secrets from outbound payload.
+
+        Returns:
+            A tuple of (redacted_payload, list_of_redactions).
+        """
         if self._security is None:
-            return request
-        sanitized, _redactions = self._security.scan_outbound(request)
-        return sanitized
+            return request, []
+        sanitized, redactions = self._security.scan_outbound(request)
+        return sanitized, redactions
 
     def _phase_toon_compress(self, request: dict[str, Any]) -> dict[str, Any]:
         """TOON phase: compress structured blocks in messages."""
@@ -358,6 +456,36 @@ class PipelineOrchestrator:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _log_compression_stats(self, stats: dict[str, Any]) -> None:
+        """Log compression statistics to the security audit database.
+
+        Stores token counts at each pipeline stage so before/after
+        comparisons can be queried later.
+
+        Args:
+            stats: Dict with keys: model, baseline_tokens, after_toon_tokens,
+                   after_security_tokens, redacted_sites, redacted_chars.
+        """
+        if self._security is not None and hasattr(self._security, "log_transaction"):
+            try:
+                import time as _time
+                # Reuse the audit log metadata column for compression stats
+                # (it is already nullable TEXT)
+                entry = AuditEntry(
+                    timestamp=_time.time(),
+                    direction="outbound",
+                    request_hash="compression_stats",
+                    model_used=stats.get("model", "unknown"),
+                    token_count=stats.get("baseline_tokens", 0),
+                    redactions_count=stats.get("redacted_sites", 0),
+                    cve_findings_count=0,
+                    status="success",
+                    metadata=json.dumps(stats),
+                )
+                self._security.log_transaction(entry)
+            except Exception:
+                logger.debug("Failed to log compression stats (non-fatal)")
 
     def _run_phase(
         self,

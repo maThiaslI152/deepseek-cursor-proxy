@@ -53,19 +53,30 @@ All 46 implementation tasks completed. 520 tests passing.
 - ✅ RAP action logging (`├ rap headers redacted compressed(X%) retrieved(X→Ymsgs)`)
 - ✅ HITL interception (AskQuestion tool_calls converted to content messages)
 - ✅ All 4 phases enabled by default (bridge, compression, retrieval, security)
+- ✅ LM Studio model auto-discovery (auto-selects embedding and security models from loaded instances)
+- ✅ `model_discovery.py` module with chat/embedding classification heuristics
+- ✅ Batch embedding with `ThreadPoolExecutor` for parallel sub-batch dispatch
+- ✅ SSE streaming inbound pipeline: accumulates stream chunks, parses into response, runs TOON rehydration and CVE scanning on stream termination
+- ✅ Port conflict detection in startup script (gracefully stops existing proxy, warns about occupied ports)
+- ✅ Security model pre-load removed from startup script (now handled by auto-discovery)
+- ✅ Token-level before/after measurement for TOON and Security phases (uses tiktoken instead of character counts)
+- ✅ Model name included in RAP action logging (e.g., `model=deepseek-v4-flash`)
+- ✅ Compression stats persisted to audit DB metadata column (token counts at each pipeline stage)
+- ✅ `metadata` field added to `AuditEntry` dataclass (nullable TEXT with JSON compression stats)
 
 ## Test Coverage
 
 | Category | Tests | Time |
 |----------|-------|------|
 | Config validation | 32 | <1s |
-| Pipeline orchestration | 27 + PBT | ~2s |
+| Pipeline orchestration | 27 + 11 PBT | ~3s |
 | Fidelity (headers, reasoning, stream) | 45 + PBT | ~5s |
 | TOON (detection, compression, rehydration) | 60 + PBT | ~15s |
-| Retrieval (chunking, embedding, Qdrant, build_context) | 80 + PBT | ~40s |
-| Security (redaction, CVE, audit) | 70 + PBT | ~20s |
-| Integration (end-to-end) | 9 | ~3s |
-| **Total** | **520** | **~96s** |
+| Retrieval (chunking, embedding, Qdrant, build_context) | 80 + 15 PBT | ~45s |
+| Security (redaction, CVE, audit) | 70 + 9 PBT | ~20s |
+| Integration (end-to-end) | 12 | ~3s |
+| Model discovery | 18 | <1s |
+| **Total** | **~560** | **~96s** |
 
 PBT = Property-Based Tests (Hypothesis)
 
@@ -89,7 +100,6 @@ PBT = Property-Based Tests (Hypothesis)
 - CVE scanning depends on LM Studio model quality — results are advisory, not authoritative.
 - Qdrant collection must be created manually on first use (auto-creation not implemented).
 - The proxy does not yet support WebSocket connections.
-- Streaming responses bypass the inbound pipeline (TOON rehydration and CVE scanning only apply to non-streaming).
 
 ## Dependencies Added
 

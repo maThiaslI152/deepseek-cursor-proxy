@@ -194,7 +194,7 @@ class FidelityModule:
 
                 # Create a task for the next chunk if we don't have one pending
                 if pending_next is None:
-                    pending_next = asyncio.ensure_future(
+                    pending_next = asyncio.create_task(
                         stream_iter.__anext__()
                     )
 

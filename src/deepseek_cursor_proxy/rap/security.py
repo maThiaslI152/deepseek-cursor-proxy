@@ -54,11 +54,11 @@ class SecurityConfig:
     """
 
     redaction_enabled: bool = True
-    cve_scanning_enabled: bool = True
+    cve_scanning_enabled: bool = False
     audit_logging_enabled: bool = True
     audit_db_path: str = "~/.deepseek-cursor-proxy/audit.sqlite3"
     local_security_model_url: str = "http://localhost:1234/v1/chat/completions"
-    security_model_name: str = "ibm-grok4-ultrafast-coder-1b"
+    security_model_name: str = ""
     entropy_threshold: float = 4.5
     redaction_patterns: list[str] = field(default_factory=list)
 
@@ -114,6 +114,8 @@ class AuditEntry:
         model_used: The model name used for the request.
         token_count: Token count for the transaction.
         status: Transaction status ('success', 'error', 'redacted').
+        metadata: Optional JSON-serializable dict for additional stats
+                  (e.g. compression before/after token counts).
     """
 
     timestamp: float
@@ -124,6 +126,7 @@ class AuditEntry:
     model_used: str
     token_count: int
     status: str = "success"  # "success" | "error" | "redacted"
+    metadata: str | None = None
 
 
 # SQL schema for the audit log database
@@ -145,6 +148,87 @@ CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
 CREATE INDEX IF NOT EXISTS idx_audit_direction ON audit_log(direction);
 CREATE INDEX IF NOT EXISTS idx_audit_status ON audit_log(status);
 """
+
+
+# Static CVE patterns — fast-path detection without LLM call
+STATIC_CVE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("code_injection", re.compile(r"\b(exec|eval|compile)\s*\(")),
+    ("sql_injection", re.compile(
+        r"cursor\.execute\(f['\"]|\.execute\(['\"].*\+|\.raw\(|\.query\(.*\+.*user"
+    )),
+    ("command_injection", re.compile(
+        r"os\.system\(|subprocess\.(call|Popen|run)\(.*shell=True"
+    )),
+    ("hardcoded_credential", re.compile(
+        r"password\s*=\s*['\"][^'\"]+['\"]"
+        r"|secret\s*=\s*['\"][^'\"]+['\"]"
+        r"|api_key\s*=\s*['\"][^'\"]+['\"]"
+    )),
+    ("pickle_deserialization", re.compile(r"pickle\.loads\(")),
+    ("path_traversal", re.compile(
+        r"os\.path\.join\(.*request|open\(.*request|Path\(.*request"
+    )),
+    ("insecure_hash", re.compile(r"\b(md5|sha1)\s*\(")),
+]
+
+
+def _check_static_cve_patterns(code: str) -> list[CVEFinding]:
+    """Check a code block against static CVE patterns.
+
+    Runs regex patterns on the code. For each match, creates a CVEFinding
+    with the matching line range. This fast-path runs before any LLM call.
+    """
+    findings: list[CVEFinding] = []
+    code_lines = code.split("\n")
+    total_lines = len(code_lines)
+
+    for pattern_name, pattern in STATIC_CVE_PATTERNS:
+        for match in pattern.finditer(code):
+            # Compute line range for this match
+            match_start = match.start()
+            line_start = code[:match_start].count("\n") + 1
+            line_end = line_start
+            # Extend to include any multi-line match
+            match_end = match.end()
+            line_end = code[:match_end].count("\n") + 1
+
+            line_start = max(1, min(total_lines, line_start))
+            line_end = max(line_start, min(total_lines, line_end))
+
+            # Severity based on pattern type
+            severity_map = {
+                "code_injection": "critical",
+                "sql_injection": "critical",
+                "command_injection": "critical",
+                "hardcoded_credential": "high",
+                "pickle_deserialization": "high",
+                "path_traversal": "high",
+                "insecure_hash": "medium",
+            }
+            recommendation_map = {
+                "code_injection": "Avoid using exec/eval/compile with untrusted input. Use safe alternatives like ast.literal_eval().",
+                "sql_injection": "Use parameterized queries or an ORM. Never interpolate user input directly into SQL.",
+                "command_injection": "Avoid shell=True in subprocess calls. Use subprocess.run with a list of arguments.",
+                "hardcoded_credential": "Use environment variables or a secret manager for credentials.",
+                "pickle_deserialization": "Avoid pickle.loads() on untrusted data. Use a safe serialization format like JSON.",
+                "path_traversal": "Validate and sanitize file paths. Use os.path.realpath() and check for path traversal.",
+                "insecure_hash": "Use SHA-256 or stronger hashing. MD5 and SHA-1 are cryptographically broken.",
+            }
+
+            snippet_lines = code_lines[line_start - 1 : line_end]
+            code_snippet = "\n".join(snippet_lines)
+
+            findings.append(CVEFinding(
+                cve_type=pattern_name,
+                severity=severity_map.get(pattern_name, "medium"),
+                code_snippet=code_snippet,
+                line_range=(line_start, line_end),
+                recommendation=recommendation_map.get(
+                    pattern_name, "Review this code for security issues."
+                ),
+            ))
+
+    return findings
 
 
 class SecurityGateway:
@@ -195,8 +279,9 @@ class SecurityGateway:
             conn.execute(
                 """INSERT INTO audit_log
                    (timestamp, direction, request_hash, model_used,
-                    token_count, redactions_count, cve_findings_count, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    token_count, redactions_count, cve_findings_count,
+                    status, metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     transaction.timestamp,
                     transaction.direction,
@@ -206,6 +291,7 @@ class SecurityGateway:
                     transaction.redactions_count,
                     transaction.cve_findings_count,
                     transaction.status,
+                    transaction.metadata,
                 ),
             )
             conn.commit()
@@ -368,10 +454,12 @@ class SecurityGateway:
         return [match.group(1).strip() for match in pattern.finditer(content)]
 
     def _analyze_code_block(self, code: str) -> list[CVEFinding]:
-        """Analyze a code block for vulnerabilities using local LM Studio.
+        """Analyze a code block for vulnerabilities.
 
-        Calls the local LM Studio model at the configured security_model_url.
-        If the model is unavailable, returns an empty list gracefully.
+        Two-stage approach:
+        1. Fast-path: Check static CVE patterns (regex-based, no model required)
+        2. Fallback: If no static patterns matched AND a model is configured,
+           call the local LM Studio model for deeper analysis.
 
         Args:
             code: The code snippet to analyze.
@@ -379,6 +467,22 @@ class SecurityGateway:
         Returns:
             List of CVEFinding instances for detected vulnerabilities.
         """
+        # Stage 1: Static CVE pattern analysis (fast-path, no LLM needed)
+        static_findings = _check_static_cve_patterns(code)
+        if static_findings:
+            logger.debug(
+                "Static CVE patterns matched %d vulnerabilities (skipping LLM)",
+                len(static_findings),
+            )
+            return static_findings
+
+        # Stage 2: LLM-based analysis (only if model is configured)
+        if not self._config.security_model_name:
+            logger.debug(
+                "No security model configured; skipping LLM-based CVE analysis"
+            )
+            return []
+
         prompt = (
             "Analyze the following code for security vulnerabilities. "
             "For each vulnerability found, respond with a JSON array of objects "

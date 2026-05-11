@@ -7,7 +7,29 @@ import time
 from typing import Any
 import zlib
 
+import tiktoken
+
 LOG = logging.getLogger("deepseek_cursor_proxy")
+
+_ENCODING: Any = None
+
+
+def count_tokens(text: str) -> int:
+    """Count tokens in text using tiktoken cl100k_base encoding.
+
+    Uses a lazily-initialized singleton encoder to avoid repeated
+    tiktoken.get_encoding() calls, which have measurable overhead.
+
+    Args:
+        text: The text to count tokens for.
+
+    Returns:
+        The number of tokens.
+    """
+    global _ENCODING
+    if _ENCODING is None:
+        _ENCODING = tiktoken.get_encoding("cl100k_base")
+    return len(_ENCODING.encode(text))
 
 
 def elapsed_ms(started: float) -> int:

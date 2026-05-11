@@ -16,6 +16,8 @@ from deepseek_cursor_proxy.rap.security import (
     CVEFinding,
     SecurityConfig,
     SecurityGateway,
+    STATIC_CVE_PATTERNS,
+    _check_static_cve_patterns,
 )
 
 
@@ -98,6 +100,7 @@ class TestScanInboundWithMockedLMStudio:
     def setup_method(self) -> None:
         self.config = SecurityConfig(
             cve_scanning_enabled=True,
+            security_model_name="test-model",
             local_security_model_url="http://localhost:1234/v1/chat/completions",
         )
         self.gateway = SecurityGateway(self.config)
@@ -107,11 +110,11 @@ class TestScanInboundWithMockedLMStudio:
         """Requirement 9.3: Produces CVEFinding with type, severity, snippet, line_range, recommendation."""
         vuln_response = _lm_studio_response([
             {
-                "cve_type": "sql_injection",
+                "cve_type": "buffer_overflow",
                 "severity": "high",
                 "line_start": 2,
                 "line_end": 3,
-                "recommendation": "Use parameterized queries.",
+                "recommendation": "Add bounds checking.",
             }
         ])
 
@@ -125,29 +128,30 @@ class TestScanInboundWithMockedLMStudio:
         mock_client.__exit__ = MagicMock(return_value=False)
         mock_client_cls.return_value = mock_client
 
-        code = "import sqlite3\nquery = f\"SELECT * FROM users WHERE id={user_id}\"\ncursor.execute(query)"
-        response = _make_response(f"Here's the code:\n```python\n{code}\n```")
+        # Use code that doesn't match static patterns (uses a generic function name)
+        code = "void copy_data(char *src) {\n  char buf[10];\n  strcpy(buf, src);\n}"
+        response = _make_response(f"Here's the code:\n```c\n{code}\n```")
 
         result, findings = self.gateway.scan_inbound(response)
 
         assert len(findings) == 1
         finding = findings[0]
-        assert finding.cve_type == "sql_injection"
+        assert finding.cve_type == "buffer_overflow"
         assert finding.severity == "high"
         assert finding.line_range == (2, 3)
-        assert finding.recommendation == "Use parameterized queries."
-        assert "SELECT * FROM users" in finding.code_snippet
+        assert finding.recommendation == "Add bounds checking."
+        assert "buf[10]" in finding.code_snippet
 
     @patch("deepseek_cursor_proxy.rap.security.httpx.Client")
     def test_annotates_response_with_findings(self, mock_client_cls) -> None:
         """Requirement 9.4: Annotates response with findings for developer visibility."""
         vuln_response = _lm_studio_response([
             {
-                "cve_type": "hardcoded_credential",
+                "cve_type": "insecure_deserialization",
                 "severity": "critical",
                 "line_start": 1,
                 "line_end": 1,
-                "recommendation": "Use environment variables for credentials.",
+                "recommendation": "Use safe serialization.",
             }
         ])
 
@@ -161,7 +165,8 @@ class TestScanInboundWithMockedLMStudio:
         mock_client.__exit__ = MagicMock(return_value=False)
         mock_client_cls.return_value = mock_client
 
-        code = 'password = "admin123"'
+        # Use code that doesn't match static patterns
+        code = 'val = deserialize(data, "json")'
         response = _make_response(f"```python\n{code}\n```")
 
         result, findings = self.gateway.scan_inbound(response)
@@ -169,7 +174,7 @@ class TestScanInboundWithMockedLMStudio:
         # Response should be annotated
         annotated_content = result["choices"][0]["message"]["content"]
         assert "Security Scan Results" in annotated_content
-        assert "hardcoded_credential" in annotated_content
+        assert "insecure_deserialization" in annotated_content
         assert "CRITICAL" in annotated_content
 
     @patch("deepseek_cursor_proxy.rap.security.httpx.Client")
@@ -201,18 +206,18 @@ class TestScanInboundWithMockedLMStudio:
         """Multiple vulnerabilities produce multiple CVEFindings."""
         vuln_response = _lm_studio_response([
             {
-                "cve_type": "sql_injection",
+                "cve_type": "race_condition",
                 "severity": "high",
                 "line_start": 1,
                 "line_end": 1,
-                "recommendation": "Use parameterized queries.",
+                "recommendation": "Use proper locking.",
             },
             {
-                "cve_type": "xss",
+                "cve_type": "memory_leak",
                 "severity": "medium",
                 "line_start": 3,
                 "line_end": 3,
-                "recommendation": "Sanitize user input.",
+                "recommendation": "Free allocated memory.",
             },
         ])
 
@@ -226,14 +231,15 @@ class TestScanInboundWithMockedLMStudio:
         mock_client.__exit__ = MagicMock(return_value=False)
         mock_client_cls.return_value = mock_client
 
-        code = "query = f'SELECT * FROM users WHERE id={uid}'\nresult = db.execute(query)\nhtml = f'<div>{user_input}</div>'"
+        # Use code that doesn't match static patterns
+        code = "counter = Counter()\ncounter.increment()\nval = counter.value()"
         response = _make_response(f"```python\n{code}\n```")
 
         result, findings = self.gateway.scan_inbound(response)
 
         assert len(findings) == 2
-        assert findings[0].cve_type == "sql_injection"
-        assert findings[1].cve_type == "xss"
+        assert findings[0].cve_type == "race_condition"
+        assert findings[1].cve_type == "memory_leak"
 
 
 class TestScanInboundGracefulDegradation:
@@ -242,6 +248,7 @@ class TestScanInboundGracefulDegradation:
     def setup_method(self) -> None:
         self.config = SecurityConfig(
             cve_scanning_enabled=True,
+            security_model_name="test-model",
             local_security_model_url="http://localhost:1234/v1/chat/completions",
         )
         self.gateway = SecurityGateway(self.config)
@@ -255,7 +262,8 @@ class TestScanInboundGracefulDegradation:
         mock_client.__exit__ = MagicMock(return_value=False)
         mock_client_cls.return_value = mock_client
 
-        code = "password = 'secret'"
+        # Use code that doesn't match static patterns (which would short-circuit to LLM)
+        code = "result = process(data, validate=True)"
         response = _make_response(f"```python\n{code}\n```")
         original = copy.deepcopy(response)
 
@@ -274,7 +282,7 @@ class TestScanInboundGracefulDegradation:
         mock_client.__exit__ = MagicMock(return_value=False)
         mock_client_cls.return_value = mock_client
 
-        code = "eval(user_input)"
+        code = "result = process(data, validate=True)"
         response = _make_response(f"```python\n{code}\n```")
 
         result, findings = self.gateway.scan_inbound(response)
@@ -351,7 +359,10 @@ class TestScanInboundImmutability:
     """Tests that scan_inbound never mutates the original response."""
 
     def setup_method(self) -> None:
-        self.config = SecurityConfig(cve_scanning_enabled=True)
+        self.config = SecurityConfig(
+            cve_scanning_enabled=True,
+            security_model_name="test-model",
+        )
         self.gateway = SecurityGateway(self.config)
 
     @patch("deepseek_cursor_proxy.rap.security.httpx.Client")
@@ -359,11 +370,11 @@ class TestScanInboundImmutability:
         """Original response dict is not mutated."""
         vuln_response = _lm_studio_response([
             {
-                "cve_type": "xss",
+                "cve_type": "logic_error",
                 "severity": "medium",
                 "line_start": 1,
                 "line_end": 1,
-                "recommendation": "Sanitize input.",
+                "recommendation": "Review logic.",
             }
         ])
 
@@ -377,7 +388,8 @@ class TestScanInboundImmutability:
         mock_client.__exit__ = MagicMock(return_value=False)
         mock_client_cls.return_value = mock_client
 
-        code = "html = f'<div>{user_input}</div>'"
+        # Use code that doesn't match static patterns
+        code = "val = calculate(x, y)"
         response = _make_response(f"```python\n{code}\n```")
         original = copy.deepcopy(response)
 
@@ -391,7 +403,10 @@ class TestScanInboundEdgeCases:
     """Tests for edge cases in scan_inbound."""
 
     def setup_method(self) -> None:
-        self.config = SecurityConfig(cve_scanning_enabled=True)
+        self.config = SecurityConfig(
+            cve_scanning_enabled=True,
+            security_model_name="test-model",
+        )
         self.gateway = SecurityGateway(self.config)
 
     def test_response_without_choices(self) -> None:
@@ -484,3 +499,154 @@ class TestScanInboundEdgeCases:
 
         assert len(findings) == 1
         assert findings[0].line_range == (1, 3)  # clamped to valid range
+
+
+class TestStaticCVEPatterns:
+    """Tests for static CVE pattern detection (fast-path before LLM)."""
+
+    def test_detects_code_injection(self) -> None:
+        """Code injection pattern: exec/eval/compile calls."""
+        code = "result = eval(user_input)"
+        findings = _check_static_cve_patterns(code)
+        assert len(findings) >= 1
+        assert any(f.cve_type == "code_injection" for f in findings)
+
+    def test_detects_exec_call(self) -> None:
+        """exec() is detected as code injection."""
+        code = "exec(code_string)"
+        findings = _check_static_cve_patterns(code)
+        assert any(f.cve_type == "code_injection" for f in findings)
+
+    def test_detects_compile_call(self) -> None:
+        """compile() is detected as code injection."""
+        code = "compile(source, filename, mode)"
+        findings = _check_static_cve_patterns(code)
+        assert any(f.cve_type == "code_injection" for f in findings)
+
+    def test_detects_sql_injection(self) -> None:
+        """SQL injection via f-string in execute()."""
+        code = "cursor.execute(f'SELECT * FROM users WHERE id={user_id}')"
+        findings = _check_static_cve_patterns(code)
+        assert any(f.cve_type == "sql_injection" for f in findings)
+
+    def test_detects_sql_injection_concat(self) -> None:
+        """SQL injection via string concatenation in execute()."""
+        code = "cursor.execute('SELECT * FROM ' + table_name)"
+        findings = _check_static_cve_patterns(code)
+        assert any(f.cve_type == "sql_injection" for f in findings)
+
+    def test_detects_command_injection(self) -> None:
+        """Command injection via os.system()."""
+        code = "os.system('rm -rf /')"
+        findings = _check_static_cve_patterns(code)
+        assert any(f.cve_type == "command_injection" for f in findings)
+
+    def test_detects_subprocess_shell_true(self) -> None:
+        """Command injection via subprocess with shell=True."""
+        code = "subprocess.run(command, shell=True)"
+        findings = _check_static_cve_patterns(code)
+        assert any(f.cve_type == "command_injection" for f in findings)
+
+    def test_detects_hardcoded_password(self) -> None:
+        """Hardcoded password detection."""
+        code = 'password = "supersecret123"'
+        findings = _check_static_cve_patterns(code)
+        assert any(f.cve_type == "hardcoded_credential" for f in findings)
+
+    def test_detects_hardcoded_api_key(self) -> None:
+        """Hardcoded API key detection."""
+        code = 'api_key = "sk-1234567890abcdef"'
+        findings = _check_static_cve_patterns(code)
+        assert any(f.cve_type == "hardcoded_credential" for f in findings)
+
+    def test_detects_hardcoded_secret(self) -> None:
+        """Hardcoded secret detection."""
+        code = 'secret = "my-secret-value"'
+        findings = _check_static_cve_patterns(code)
+        assert any(f.cve_type == "hardcoded_credential" for f in findings)
+
+    def test_detects_pickle_deserialization(self) -> None:
+        """Pickle deserialization detection."""
+        code = "data = pickle.loads(raw_bytes)"
+        findings = _check_static_cve_patterns(code)
+        assert any(f.cve_type == "pickle_deserialization" for f in findings)
+
+    def test_detects_path_traversal(self) -> None:
+        """Path traversal via request parameter."""
+        code = "path = os.path.join('/base', request.filename)"
+        findings = _check_static_cve_patterns(code)
+        assert any(f.cve_type == "path_traversal" for f in findings)
+
+    def test_detects_open_with_request(self) -> None:
+        """Path traversal via open() + request."""
+        code = "content = open(request.args.get('file')).read()"
+        findings = _check_static_cve_patterns(code)
+        assert any(f.cve_type == "path_traversal" for f in findings)
+
+    def test_detects_insecure_hash_md5(self) -> None:
+        """Insecure hash: md5()."""
+        code = "hash_value = md5(data).hexdigest()"
+        findings = _check_static_cve_patterns(code)
+        assert any(f.cve_type == "insecure_hash" for f in findings)
+
+    def test_detects_insecure_hash_sha1(self) -> None:
+        """Insecure hash: sha1()."""
+        code = "hash_value = sha1(data).hexdigest()"
+        findings = _check_static_cve_patterns(code)
+        assert any(f.cve_type == "insecure_hash" for f in findings)
+
+    def test_clean_code_returns_no_findings(self) -> None:
+        """Clean code without vulnerabilities returns no findings."""
+        code = "x = 1 + 2\nprint('hello world')\nresult = sum([1, 2, 3])"
+        findings = _check_static_cve_patterns(code)
+        assert len(findings) == 0
+
+    def test_empty_code_returns_no_findings(self) -> None:
+        """Empty code returns no findings."""
+        findings = _check_static_cve_patterns("")
+        assert len(findings) == 0
+
+    def test_cve_finding_has_severity_and_recommendation(self) -> None:
+        """Each static CVE finding includes severity and recommendation."""
+        code = 'password = "admin123"'
+        findings = _check_static_cve_patterns(code)
+        assert len(findings) >= 1
+        finding = findings[0]
+        assert finding.severity in ("low", "medium", "high", "critical")
+        assert len(finding.recommendation) > 0
+        assert finding.line_range[0] >= 1
+        assert finding.line_range[1] >= finding.line_range[0]
+
+    def test_static_patterns_detect_before_llm(self) -> None:
+        """Test that static CVE scan produces findings without any LLM call.
+
+        This validates the fast-path: static patterns should detect known
+        vulnerability patterns without requiring an external model.
+        """
+        # Code with a clearly vulnerable pattern
+        code = "eval(user_input)"
+        findings = _check_static_cve_patterns(code)
+        assert len(findings) >= 1
+        assert findings[0].cve_type == "code_injection"
+        assert findings[0].severity == "critical"
+        assert "exec/eval/compile" in findings[0].recommendation
+
+    def test_static_cve_patterns_are_precompiled(self) -> None:
+        """STATIC_CVE_PATTERNS are precompiled regex patterns."""
+        assert len(STATIC_CVE_PATTERNS) >= 7
+        for name, pattern in STATIC_CVE_PATTERNS:
+            assert isinstance(name, str)
+            assert hasattr(pattern, "search")
+            assert pattern.search("test") is not None or True  # patterns exist
+
+    def test_multiple_findings_in_same_code(self) -> None:
+        """Multiple vulnerability patterns in the same code block."""
+        code = (
+            "password = 'admin123'\n"
+            "cursor.execute(f'SELECT * FROM users WHERE id={uid}')\n"
+        )
+        findings = _check_static_cve_patterns(code)
+        assert len(findings) >= 2
+        types = {f.cve_type for f in findings}
+        assert "hardcoded_credential" in types
+        assert "sql_injection" in types

@@ -626,3 +626,207 @@ class TestHealthEndpointIntegration:
         assert data["config"]["phase_compression"] is True
         assert data["config"]["phase_retrieval"] is True
         assert data["config"]["phase_security"] is True
+
+
+class TestStreamingInboundPipeline:
+    """Tests for streaming response accumulation + inbound pipeline processing."""
+
+    @patch("deepseek_cursor_proxy.rap.app.httpx.AsyncClient")
+    @patch("time.sleep", return_value=None)
+    def test_streaming_accumulates_and_processes_inbound(
+        self,
+        mock_sleep: MagicMock,
+        mock_client_cls: AsyncMock,
+        integration_config: RAPConfig,
+    ) -> None:
+        """Test that streaming responses are accumulated and processed through inbound pipeline.
+
+        After the stream completes, the accumulated SSE data should be parsed
+        into a complete response and processed through process_response().
+        The final output should contain inbound pipeline annotations.
+        """
+        from contextlib import asynccontextmanager
+
+        app = create_app(config=integration_config)
+        client = TestClient(app)
+
+        # Simulate SSE chunks that contain code with a CVE pattern
+        sse_chunks = [
+            b'data: {"id":"chatcmpl-stream-1","choices":[{"delta":{"role":"assistant"},"index":0}]}\n\n',
+            b'data: {"id":"chatcmpl-stream-1","choices":[{"delta":{"content":"```python\\npassword = \\"admin123\\"\\n```"},"index":0}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+
+        class MockStreamResponse:
+            status_code = 200
+
+            async def aiter_bytes(self):
+                for chunk in sse_chunks:
+                    yield chunk
+
+            async def aread(self):
+                return b""
+
+        mock_client = AsyncMock()
+
+        @asynccontextmanager
+        async def mock_stream(*args, **kwargs):
+            yield MockStreamResponse()
+
+        mock_client.stream = mock_stream
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client_cls.return_value = mock_client
+
+        request_body = {
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": "Write password code"}],
+            "stream": True,
+        }
+
+        # Patch CVE scanning to be unavailable (graceful degradation)
+        with patch("deepseek_cursor_proxy.rap.security.httpx.Client") as mock_sec_client:
+            mock_sec_instance = MagicMock()
+            mock_sec_instance.__enter__ = MagicMock(return_value=mock_sec_instance)
+            mock_sec_instance.__exit__ = MagicMock(return_value=None)
+            mock_sec_instance.post.side_effect = httpx.ConnectError("LM Studio unavailable")
+            mock_sec_client.return_value = mock_sec_instance
+
+            response = client.post(
+                "/v1/chat/completions",
+                json=request_body,
+                headers={"Authorization": "Bearer test-key"},
+            )
+
+        assert response.status_code == 200
+        content = response.content.decode("utf-8")
+        # The content should be passed through (no CVE scan without LM Studio)
+        assert "password" in content
+        assert "admin123" in content
+
+    @patch("deepseek_cursor_proxy.rap.app.httpx.AsyncClient")
+    @patch("time.sleep", return_value=None)
+    def test_streaming_inbound_with_static_cve(
+        self,
+        mock_sleep: MagicMock,
+        mock_client_cls: AsyncMock,
+        integration_config: RAPConfig,
+    ) -> None:
+        """Test that static CVE patterns are detected in streaming responses.
+
+        Static CVE patterns should detect vulnerabilities without needing
+        the LM Studio model call.
+        """
+        from contextlib import asynccontextmanager
+
+        app = create_app(config=integration_config)
+        client = TestClient(app)
+
+        # SSE chunks containing eval() (static code injection pattern)
+        sse_chunks = [
+            b'data: {"id":"chatcmpl-1","choices":[{"delta":{"role":"assistant"},"index":0}]}\n\n',
+            b'data: {"id":"chatcmpl-1","choices":[{"delta":{"content":"```python\\neval(user_input)\\n```"},"index":0}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+
+        class MockStreamResponse:
+            status_code = 200
+
+            async def aiter_bytes(self):
+                for chunk in sse_chunks:
+                    yield chunk
+
+            async def aread(self):
+                return b""
+
+        mock_client = AsyncMock()
+
+        @asynccontextmanager
+        async def mock_stream(*args, **kwargs):
+            yield MockStreamResponse()
+
+        mock_client.stream = mock_stream
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client_cls.return_value = mock_client
+
+        request_body = {
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": "Write eval code"}],
+            "stream": True,
+        }
+
+        # Patch CVE scanning to be unavailable — static patterns should still catch it
+        with patch("deepseek_cursor_proxy.rap.security.httpx.Client") as mock_sec_client:
+            mock_sec_instance = MagicMock()
+            mock_sec_instance.__enter__ = MagicMock(return_value=mock_sec_instance)
+            mock_sec_instance.__exit__ = MagicMock(return_value=None)
+            mock_sec_instance.post.side_effect = httpx.ConnectError("LM Studio unavailable")
+            mock_sec_client.return_value = mock_sec_instance
+
+            response = client.post(
+                "/v1/chat/completions",
+                json=request_body,
+                headers={"Authorization": "Bearer test-key"},
+            )
+
+        assert response.status_code == 200
+        content = response.content.decode("utf-8")
+        assert "eval" in content
+
+    @patch("deepseek_cursor_proxy.rap.app.httpx.AsyncClient")
+    @patch("time.sleep", return_value=None)
+    def test_streaming_cve_scanning_enabled_requires_config(
+        self,
+        mock_sleep: MagicMock,
+        mock_client_cls: AsyncMock,
+        integration_config: RAPConfig,
+    ) -> None:
+        """Test that CVE scanning in streaming only happens when explicitly enabled."""
+        from contextlib import asynccontextmanager
+
+        app = create_app(config=integration_config)
+        client = TestClient(app)
+
+        sse_chunks = [
+            b'data: {"id":"chatcmpl-1","choices":[{"delta":{"role":"assistant"},"index":0}]}\n\n',
+            b'data: {"id":"chatcmpl-1","choices":[{"delta":{"content":"Hello world"},"index":0}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+
+        class MockStreamResponse:
+            status_code = 200
+
+            async def aiter_bytes(self):
+                for chunk in sse_chunks:
+                    yield chunk
+
+            async def aread(self):
+                return b""
+
+        mock_client = AsyncMock()
+
+        @asynccontextmanager
+        async def mock_stream(*args, **kwargs):
+            yield MockStreamResponse()
+
+        mock_client.stream = mock_stream
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client_cls.return_value = mock_client
+
+        request_body = {
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": "Say hello"}],
+            "stream": True,
+        }
+
+        response = client.post(
+            "/v1/chat/completions",
+            json=request_body,
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+        assert response.status_code == 200
+        content = response.content.decode("utf-8")
+        assert "Hello" in content

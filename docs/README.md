@@ -770,7 +770,7 @@ curl http://127.0.0.1:9000/healthz         # Proxy
 
 - **TOON scope** — Only handles file trees, symbol maps, and multi-file diffs. Other structured formats pass through unchanged.
 - **CVE scanning quality** — Depends on local LLM quality. Results are advisory, not authoritative.
-- **Streaming bypass** — Streaming responses bypass the inbound pipeline (TOON re-hydration and CVE scanning only apply to non-streaming).
+- **Streaming bypass (resolved)** — Streaming responses previously bypassed the inbound pipeline; now the SSE stream is accumulated, parsed into a complete response, and processed through TOON re-hydration and CVE scanning on stream termination.
 - **Qdrant collection** — Not auto-created. Must exist before first use.
 - **No WebSocket support** — HTTP only.
 - **Ngrok free tier** — URLs change on restart. Use `--ngrok URL` with a fixed domain if available.

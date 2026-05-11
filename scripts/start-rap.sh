@@ -23,8 +23,6 @@ QDRANT_IMAGE="docker.io/qdrant/qdrant:latest"
 
 LMS_PORT=1234
 EMBEDDING_MODEL="text-embedding-nomic-embed-text-v1.5-embedding"
-SECURITY_MODEL="ibm-grok4-ultrafast-coder-1b"
-SECURITY_MODEL="ibm-grok4-ultrafast-coder-1b"
 
 PROXY_HOST="127.0.0.1"
 PROXY_PORT=9000
@@ -237,46 +235,34 @@ print('no')
     done
 fi
 
-# Load security model (for CVE scanning)
-SEC_MODEL_LOADED=$(curl -sf "http://localhost:${LMS_PORT}/api/v1/models" | \
-    python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-for m in data.get('models', []):
-    if m.get('key') == '$SECURITY_MODEL' and len(m.get('loaded_instances', [])) > 0:
-        print('yes')
-        sys.exit(0)
-print('no')
-" 2>/dev/null || echo "no")
-
-if [[ "$SEC_MODEL_LOADED" == "yes" ]]; then
-    info "Security model already loaded."
-else
-    info "Loading security model: $SECURITY_MODEL"
-    lms load "$SECURITY_MODEL" --gpu max 2>/dev/null || {
-        warn "Could not load security model. CVE scanning will be skipped."
-    }
-    for i in {1..60}; do
-        SEC_MODEL_LOADED=$(curl -sf "http://localhost:${LMS_PORT}/api/v1/models" | \
-            python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-for m in data.get('models', []):
-    if m.get('key') == '$SECURITY_MODEL' and len(m.get('loaded_instances', [])) > 0:
-        print('yes')
-        sys.exit(0)
-print('no')
-" 2>/dev/null || echo "no")
-        [[ "$SEC_MODEL_LOADED" == "yes" ]] && { info "Security model loaded."; break; }
-        [[ $i -eq 60 ]] && { warn "Security model still loading. CVE scanning may be degraded."; break; }
-        sleep 1
-    done
-fi
-
 # --- Start Proxy ---
 info "Starting proxy with RAP pipeline..."
 
 cd "$(dirname "$0")/.."
+
+# Avoid OSError [Errno 48] Address already in use: stop a prior proxy on this port
+if curl -sf "http://${PROXY_HOST}:${PROXY_PORT}/healthz" &>/dev/null; then
+    warn "Stopping existing proxy on ${PROXY_HOST}:${PROXY_PORT} (already responding to /healthz)."
+    pkill -f "deepseek_cursor_proxy" 2>/dev/null || true
+    sleep 2
+fi
+if command -v lsof &>/dev/null; then
+    if lsof -nP -iTCP:"${PROXY_PORT}" -sTCP:LISTEN &>/dev/null; then
+        if ! curl -sf "http://${PROXY_HOST}:${PROXY_PORT}/healthz" &>/dev/null; then
+            warn "Port ${PROXY_PORT} is in use but /healthz did not respond; clearing stale deepseek_cursor_proxy if any..."
+            pkill -f "deepseek_cursor_proxy" 2>/dev/null || true
+            sleep 2
+        fi
+        if lsof -nP -iTCP:"${PROXY_PORT}" -sTCP:LISTEN &>/dev/null; then
+            if ! curl -sf "http://${PROXY_HOST}:${PROXY_PORT}/healthz" &>/dev/null; then
+                error "Port ${PROXY_PORT} is still in use by another process."
+                error "Free the port or run: ./scripts/start-rap.sh --stop   (then retry)"
+                error "Inspect: lsof -nP -iTCP:${PROXY_PORT} -sTCP:LISTEN"
+                exit 1
+            fi
+        fi
+    fi
+fi
 
 # Determine ngrok behavior
 NGROK_FLAG="--ngrok"
@@ -288,6 +274,12 @@ fi
 # Start the original proxy (which now has RAP pipeline integrated)
 python -m deepseek_cursor_proxy --port "$PROXY_PORT" $NGROK_FLAG &
 PROXY_PID=$!
+
+sleep 1
+if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    error "Proxy exited immediately (common cause: port ${PROXY_PORT} still in use). Try: ./scripts/start-rap.sh --stop"
+    exit 1
+fi
 
 # Wait for proxy to be ready
 for i in {1..15}; do

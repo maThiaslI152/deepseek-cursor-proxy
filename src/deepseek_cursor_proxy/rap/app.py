@@ -174,7 +174,7 @@ def create_app(config: RAPConfig | None = None) -> FastAPI:
 
         if is_streaming:
             return await _handle_streaming(
-                upstream_url, upstream_headers, upstream_body, config
+                upstream_url, upstream_headers, upstream_body, config, pipeline
             )
         else:
             return await _handle_non_streaming(
@@ -184,15 +184,80 @@ def create_app(config: RAPConfig | None = None) -> FastAPI:
     return app
 
 
+def _parse_sse_to_response(sse_data: bytes) -> dict[str, Any] | None:
+    """Parse accumulated SSE data into a complete chat completion response.
+
+    Extracts all `data:` lines, parses the JSON, and merges delta fields
+    into a single response dict. Returns None if no valid SSE data found.
+    """
+    lines = sse_data.decode("utf-8").split("\n")
+    merged_choices: dict[int, dict[str, Any]] = {}
+    response_meta: dict[str, Any] = {}
+    saw_data = False
+
+    for line in lines:
+        if not line.startswith("data: "):
+            continue
+        payload = line[6:].strip()
+        if payload == "[DONE]":
+            continue
+        try:
+            chunk = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+
+        saw_data = True
+        # Capture metadata from first chunk
+        if not response_meta:
+            response_meta = {
+                "id": chunk.get("id", ""),
+                "object": chunk.get("object", "chat.completion"),
+                "created": chunk.get("created", 0),
+                "model": chunk.get("model", ""),
+            }
+
+        # Merge choices
+        for choice in chunk.get("choices", []):
+            idx = choice.get("index", 0)
+            if idx not in merged_choices:
+                merged_choices[idx] = {
+                    "index": idx,
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": choice.get("finish_reason", None),
+                }
+            delta = choice.get("delta", {})
+            if "content" in delta and delta["content"]:
+                merged_choices[idx]["message"]["content"] += delta["content"]
+            if "role" in delta:
+                merged_choices[idx]["message"]["role"] = delta["role"]
+            if choice.get("finish_reason"):
+                merged_choices[idx]["finish_reason"] = choice["finish_reason"]
+
+    if not saw_data:
+        return None
+
+    return {
+        **response_meta,
+        "choices": [merged_choices[k] for k in sorted(merged_choices.keys())],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+
 async def _handle_streaming(
     upstream_url: str,
     headers: dict[str, str],
     body: str,
     config: RAPConfig,
+    pipeline: PipelineOrchestrator | None = None,
 ) -> StreamingResponse | JSONResponse:
-    """Handle streaming (SSE) responses by passing through from upstream."""
+    """Handle streaming (SSE) responses.
+
+    Accumulates the full SSE response and runs it through the inbound
+    pipeline (TOON rehydrate + CVE scan) when the stream terminates.
+    """
 
     async def stream_generator() -> AsyncIterator[bytes]:
+        accumulated = bytearray()
         async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
             try:
                 async with client.stream(
@@ -202,13 +267,13 @@ async def _handle_streaming(
                     content=body.encode("utf-8"),
                 ) as response:
                     if response.status_code != 200:
-                        # Yield error as SSE event
                         error_body = await response.aread()
                         yield b"data: " + error_body + b"\n\n"
                         yield b"data: [DONE]\n\n"
                         return
 
                     async for chunk in response.aiter_bytes():
+                        accumulated.extend(chunk)
                         yield chunk
             except httpx.ConnectError as exc:
                 error_msg = json.dumps(
@@ -216,12 +281,26 @@ async def _handle_streaming(
                 )
                 yield b"data: " + error_msg.encode("utf-8") + b"\n\n"
                 yield b"data: [DONE]\n\n"
+                return
             except httpx.ReadTimeout as exc:
                 error_msg = json.dumps(
                     {"error": {"message": f"Upstream read timeout: {exc}"}}
                 )
                 yield b"data: " + error_msg.encode("utf-8") + b"\n\n"
                 yield b"data: [DONE]\n\n"
+                return
+
+        # Stream complete — apply inbound pipeline to accumulated response
+        if pipeline is not None:
+            try:
+                parsed = _parse_sse_to_response(bytes(accumulated))
+                if parsed is not None:
+                    processed = pipeline.process_response(parsed)
+                    # Yield the processed content as a final SSE event
+                    processed_bytes = json.dumps(processed).encode("utf-8")
+                    yield b"data: " + processed_bytes + b"\n\n"
+            except Exception as exc:
+                logger.warning("Inbound pipeline processing failed on stream: %s", exc)
 
     return StreamingResponse(
         stream_generator(),
