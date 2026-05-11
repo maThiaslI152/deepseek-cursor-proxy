@@ -685,13 +685,24 @@ lms unload --all                   # Unload all models
 
 **Post-spec enhancements:**
 - ✅ Fixed retry loop memory overflow bug (delay calculation going to 0.0s)
+- ✅ Fixed retry logic to not retry 400/4xx client errors (non-retryable)
+- ✅ Fixed Qdrant communication: uses JSON REST API (not MessagePack over HTTP)
 - ✅ Added LM Studio health check via `/api/v1/models` (reports model loaded status)
 - ✅ Updated default embedding model to `text-embedding-nomic-embed-text-v1.5-embedding`
-- ✅ Created `scripts/start-rap.sh` startup script (Podman + LM Studio + proxy)
+- ✅ Added explicit `security_model_name` config (default: `ibm-grok4-ultrafast-coder-1b`)
+- ✅ Startup script pre-loads both embedding + security models at boot
+- ✅ Created `scripts/start-rap.sh` startup script (Podman + LM Studio + proxy + ngrok)
 - ✅ Reduced property test examples for faster CI (200→30, 100→20, 50→10)
 - ✅ Original proxy integration (RAP pipeline wired into `server.py`)
+- ✅ RAP action logging (`├ rap headers redacted compressed(X%) retrieved(X→Ymsgs)`)
+- ✅ HITL interception (AskQuestion tool_calls converted to content messages)
+- ✅ All 4 phases enabled by default (bridge, compression, retrieval, security)
 
 **All 46 implementation tasks completed. 520 tests passing.**
+
+**Operational notes:**
+- TOON compression activates when messages contain structured blocks (file trees, symbol maps, diffs). In Cursor's planning/agent mode with tool_calls, structured blocks are rare — TOON will activate more in manual code-paste workflows.
+- Retrieval/Qdrant activates when there are "middle context" messages with text content to chunk. In agent mode, most context is tool_call/tool_result pairs which are preserved unchanged to maintain agent state.
 
 ---
 
@@ -709,7 +720,11 @@ Wait 30–120s for loading from external storage.
 
 ### Memory overflow from retry loop
 
-**Fixed.** The retry logic previously had a bug where delay could calculate to 0.0s, causing a tight infinite loop. Now capped at 60s per delay, 5 minutes total.
+**Fixed.** The retry logic previously had a bug where delay could calculate to 0.0s, causing a tight infinite loop. Now capped at 60s per delay, 5 minutes total. Additionally, 4xx errors (400, 401, 404, 422) are never retried since they indicate client errors that won't succeed on retry.
+
+### Qdrant 400 Bad Request on upsert
+
+**Fixed.** Qdrant's REST API only accepts JSON, not MessagePack. The proxy now sends JSON to Qdrant's HTTP endpoints. MessagePack efficiency is still validated in property tests as a format comparison.
 
 ### Qdrant not starting
 

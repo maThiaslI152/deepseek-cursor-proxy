@@ -41,10 +41,18 @@ All 46 implementation tasks completed. 520 tests passing.
 
 ### Post-Spec Enhancements
 - ✅ Fixed retry loop memory overflow bug (delay calculation going to 0.0s)
+- ✅ Fixed retry logic to not retry 400/4xx client errors (non-retryable)
+- ✅ Fixed Qdrant communication: uses JSON REST API (not MessagePack over HTTP)
 - ✅ Added LM Studio health check via `/api/v1/models` (reports model loaded status)
 - ✅ Updated default embedding model to `text-embedding-nomic-embed-text-v1.5-embedding`
-- ✅ Created `scripts/start-rap.sh` startup script (Podman + LM Studio + proxy)
+- ✅ Added explicit `security_model_name` config (default: `ibm-grok4-ultrafast-coder-1b`)
+- ✅ Startup script pre-loads both embedding + security models at boot
+- ✅ Created `scripts/start-rap.sh` startup script (Podman + LM Studio + proxy + ngrok)
 - ✅ Reduced property test examples for faster CI (200→30, 100→20, 50→10)
+- ✅ Original proxy integration (RAP pipeline wired into `server.py`)
+- ✅ RAP action logging (`├ rap headers redacted compressed(X%) retrieved(X→Ymsgs)`)
+- ✅ HITL interception (AskQuestion tool_calls converted to content messages)
+- ✅ All 4 phases enabled by default (bridge, compression, retrieval, security)
 
 ## Test Coverage
 
