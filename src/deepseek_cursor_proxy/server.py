@@ -1131,6 +1131,34 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             return line, False, recovery_notice, None
 
         if isinstance(chunk, dict):
+            # --- RAP: HITL interception for streaming ---
+            # Convert AskQuestion tool_calls to content in streaming chunks
+            rap_pipeline = getattr(self.server, "rap_pipeline", None)
+            if rap_pipeline is not None:
+                choices = chunk.get("choices", [])
+                for choice in choices:
+                    delta = choice.get("delta", {})
+                    tool_calls = delta.get("tool_calls", [])
+                    finish_reason = choice.get("finish_reason", "")
+                    if tool_calls:
+                        for tc in tool_calls:
+                            func = tc.get("function", {})
+                            func_name = func.get("name", "")
+                            if func_name.lower() in ("askquestion", "ask_question", "ask_user"):
+                                # Convert tool_call delta to content delta
+                                args = func.get("arguments", "")
+                                try:
+                                    args_parsed = json.loads(args) if args else {}
+                                    question = args_parsed.get("question", args_parsed.get("message", args))
+                                except (json.JSONDecodeError, TypeError):
+                                    question = args
+                                delta["content"] = question if question else ""
+                                delta.pop("tool_calls", None)
+                                if finish_reason == "tool_calls":
+                                    choice["finish_reason"] = "stop"
+                                LOG.info("├ rap_in  hitl_intercepted (AskQuestion→content)")
+                                break
+
             if recovery_notice and inject_recovery_notice(chunk, recovery_notice):
                 recovery_notice = None
             accumulator.ingest_chunk(chunk)

@@ -155,6 +155,10 @@ class PipelineOrchestrator:
         """
         result = response
 
+        # Phase 0: HITL interception (convert AskQuestion tool_calls to content)
+        if self._config.phase_bridge:
+            result = self._run_phase("hitl_intercept", self._phase_hitl_intercept, result)
+
         # Phase 1: Stream Health (heartbeat / reasoning extraction)
         if self._config.phase_bridge:
             result = self._run_phase("stream_health", self._phase_stream_health, result)
@@ -252,6 +256,78 @@ class PipelineOrchestrator:
             return request
         reduced = self._retrieval.build_reduced_context(query, messages)
         return {**request, "messages": reduced}
+
+    def _phase_hitl_intercept(self, response: dict[str, Any]) -> dict[str, Any]:
+        """Intercept HITL tool_calls (AskQuestion) and convert to content.
+
+        Cursor's Plan mode uses an AskQuestion tool_call to pause and ask
+        the user for approval. On free/limited tiers, this gets blocked
+        behind an "upgrade" button. This phase converts AskQuestion tool_calls
+        into regular assistant content messages so the response flows through
+        without requiring HITL approval.
+        """
+        choices = response.get("choices", [])
+        if not choices:
+            return response
+
+        modified = False
+        for choice in choices:
+            finish_reason = choice.get("finish_reason", "")
+            message = choice.get("message", {})
+            tool_calls = message.get("tool_calls", [])
+
+            if finish_reason != "tool_calls" or not tool_calls:
+                continue
+
+            # Check if any tool_call is AskQuestion
+            ask_questions = []
+            other_tool_calls = []
+            for tc in tool_calls:
+                func = tc.get("function", {})
+                func_name = func.get("name", "")
+                if func_name.lower() in ("askquestion", "ask_question", "ask_user"):
+                    ask_questions.append(tc)
+                else:
+                    other_tool_calls.append(tc)
+
+            if not ask_questions:
+                continue
+
+            # Extract the question text from AskQuestion arguments
+            question_texts = []
+            for aq in ask_questions:
+                func = aq.get("function", {})
+                args_str = func.get("arguments", "{}")
+                try:
+                    import json as _json
+                    args = _json.loads(args_str) if isinstance(args_str, str) else args_str
+                    question = args.get("question", args.get("message", args.get("content", str(args))))
+                    question_texts.append(question)
+                except Exception:
+                    question_texts.append(args_str)
+
+            # Convert to regular content message
+            combined_question = "\n".join(question_texts)
+            existing_content = message.get("content", "") or ""
+            new_content = existing_content
+            if combined_question:
+                if new_content:
+                    new_content += "\n\n"
+                new_content += combined_question
+
+            # Update the message
+            message["content"] = new_content
+            if other_tool_calls:
+                message["tool_calls"] = other_tool_calls
+            else:
+                # Remove tool_calls entirely and change finish_reason
+                message.pop("tool_calls", None)
+                choice["finish_reason"] = "stop"
+
+            modified = True
+            logger.info("HITL intercepted: converted AskQuestion to content")
+
+        return response
 
     def _phase_stream_health(self, response: dict[str, Any]) -> dict[str, Any]:
         """Stream health phase: extract reasoning tokens."""
