@@ -23,6 +23,7 @@ QDRANT_IMAGE="docker.io/qdrant/qdrant:latest"
 
 LMS_PORT=1234
 EMBEDDING_MODEL="text-embedding-nomic-embed-text-v1.5-embedding"
+SECURITY_MODEL="ibm-grok4-ultrafast-coder-1b"
 
 PROXY_HOST="127.0.0.1"
 PROXY_PORT=9000
@@ -231,6 +232,42 @@ print('no')
 " 2>/dev/null || echo "no")
         [[ "$MODEL_LOADED" == "yes" ]] && { info "Embedding model loaded."; break; }
         [[ $i -eq 120 ]] && { warn "Model still loading. Proxy will start in degraded mode."; break; }
+        sleep 1
+    done
+fi
+
+# Load security model (for CVE scanning)
+SEC_MODEL_LOADED=$(curl -sf "http://localhost:${LMS_PORT}/api/v1/models" | \
+    python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for m in data.get('models', []):
+    if m.get('key') == '$SECURITY_MODEL' and len(m.get('loaded_instances', [])) > 0:
+        print('yes')
+        sys.exit(0)
+print('no')
+" 2>/dev/null || echo "no")
+
+if [[ "$SEC_MODEL_LOADED" == "yes" ]]; then
+    info "Security model already loaded."
+else
+    info "Loading security model: $SECURITY_MODEL"
+    lms load "$SECURITY_MODEL" --gpu max 2>/dev/null || {
+        warn "Could not load security model. CVE scanning will be skipped."
+    }
+    for i in {1..60}; do
+        SEC_MODEL_LOADED=$(curl -sf "http://localhost:${LMS_PORT}/api/v1/models" | \
+            python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for m in data.get('models', []):
+    if m.get('key') == '$SECURITY_MODEL' and len(m.get('loaded_instances', [])) > 0:
+        print('yes')
+        sys.exit(0)
+print('no')
+" 2>/dev/null || echo "no")
+        [[ "$SEC_MODEL_LOADED" == "yes" ]] && { info "Security model loaded."; break; }
+        [[ $i -eq 60 ]] && { warn "Security model still loading. CVE scanning may be degraded."; break; }
         sleep 1
     done
 fi

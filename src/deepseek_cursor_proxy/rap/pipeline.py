@@ -63,6 +63,7 @@ class PipelineOrchestrator:
                 audit_logging_enabled=True,
                 audit_db_path=str(config.audit_db_path),
                 local_security_model_url=config.security_model_url,
+                security_model_name=config.security_model_name,
                 entropy_threshold=config.entropy_threshold,
             ))
 

@@ -58,6 +58,7 @@ class SecurityConfig:
     audit_logging_enabled: bool = True
     audit_db_path: str = "~/.deepseek-cursor-proxy/audit.sqlite3"
     local_security_model_url: str = "http://localhost:1234/v1/chat/completions"
+    security_model_name: str = "ibm-grok4-ultrafast-coder-1b"
     entropy_threshold: float = 4.5
     redaction_patterns: list[str] = field(default_factory=list)
 
@@ -394,7 +395,7 @@ class SecurityGateway:
                 resp = client.post(
                     self._config.local_security_model_url,
                     json={
-                        "model": "security",
+                        "model": self._config.security_model_name,
                         "messages": [
                             {"role": "system", "content": "You are a security code reviewer. Respond only with valid JSON."},
                             {"role": "user", "content": prompt},

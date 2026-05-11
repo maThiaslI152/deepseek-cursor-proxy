@@ -77,6 +77,7 @@ class RAPConfig:
     )
     entropy_threshold: float = 4.5
     security_model_url: str = "http://localhost:1234/v1/chat/completions"
+    security_model_name: str = "ibm-grok4-ultrafast-coder-1b"
 
     # Phase control
     phase_bridge: bool = True
