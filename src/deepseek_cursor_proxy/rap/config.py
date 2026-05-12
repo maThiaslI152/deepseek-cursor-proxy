@@ -75,7 +75,7 @@ class RAPConfig:
     audit_db_path: Path = field(
         default_factory=lambda: Path("~/.deepseek-cursor-proxy/audit.sqlite3")
     )
-    entropy_threshold: float = 4.5
+    entropy_threshold: float = 5.5
     security_model_url: str = "http://localhost:1234/v1/chat/completions"
     security_model_name: str = ""
 
