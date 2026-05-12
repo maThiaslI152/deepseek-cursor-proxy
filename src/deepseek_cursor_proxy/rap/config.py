@@ -83,7 +83,7 @@ class RAPConfig:
     phase_bridge: bool = True
     phase_compression: bool = True
     phase_retrieval: bool = True
-    phase_security: bool = True
+    phase_security: bool = False
 
     def __post_init__(self) -> None:
         """Validate all configuration fields after construction."""
