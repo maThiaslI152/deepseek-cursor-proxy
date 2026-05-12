@@ -325,7 +325,9 @@ class SecurityGateway:
         db_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Create/open the database
-        self._db_conn = sqlite3.connect(str(db_path))
+        # check_same_thread=False is needed because the proxy uses ThreadingHTTPServer
+        # and requests come from different threads
+        self._db_conn = sqlite3.connect(str(db_path), check_same_thread=False)
 
         # Create schema
         self._db_conn.executescript(AUDIT_SCHEMA)
