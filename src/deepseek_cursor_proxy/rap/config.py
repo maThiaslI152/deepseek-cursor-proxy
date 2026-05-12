@@ -82,7 +82,7 @@ class RAPConfig:
     # Phase control
     phase_bridge: bool = True
     phase_compression: bool = True
-    phase_retrieval: bool = True
+    phase_retrieval: bool = False
     phase_security: bool = False
 
     def __post_init__(self) -> None:
